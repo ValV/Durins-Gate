@@ -30,7 +30,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
-import net.schmizz.sshj.transport.verification.PromiscuousVerifier
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
@@ -54,6 +53,7 @@ class SshForegroundService : Service() {
         const val NOTIFICATION_ID = 1
         const val ACTION_STOP_ALL = "STOP_ALL"
         const val ACTION_STOP_CONFIG = "STOP_CONFIG"
+        const val ACTION_RETRY_CONFIG = "RETRY_CONFIG"
         const val EXTRA_CONFIG_ID = "config_id"
 
         private val _activeConfigIds = mutableSetOf<String>()
@@ -69,6 +69,11 @@ class SshForegroundService : Service() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock =
             powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DurinsGate::SSH_WakeLock")
+
+        serviceScope.launch {
+            KeyManager(this@SshForegroundService).cleanupOrphanedKeys()
+        }
+
         registerNetworkCallback()
     }
 
@@ -88,7 +93,6 @@ class SshForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Ensure service is in foreground immediately
         updateSummaryNotification()
 
         if (intent == null) {
@@ -105,6 +109,17 @@ class SshForegroundService : Service() {
             ACTION_STOP_CONFIG -> {
                 val configId = intent.getStringExtra(EXTRA_CONFIG_ID)
                 if (configId != null) stopConfig(configId)
+                return START_STICKY
+            }
+
+            ACTION_RETRY_CONFIG -> {
+                val configId = intent.getStringExtra(EXTRA_CONFIG_ID)
+                if (configId != null) {
+                    serviceScope.launch {
+                        val storage = ConfigStorage(this@SshForegroundService)
+                        storage.loadConfigs().find { it.id == configId }?.let { startConfig(it) }
+                    }
+                }
                 return START_STICKY
             }
         }
@@ -197,6 +212,34 @@ class SshForegroundService : Service() {
         }
     }
 
+    private fun showVerificationNotification(config: SshConfig) {
+        val intent = Intent(this, HostKeyApprovalActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_CONFIG_ID, config.id)
+            putExtra("hostname", config.host)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            config.id.hashCode(),
+            intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Security Verification Required")
+            .setContentText("Gate [${config.name}] encountered an unknown host key.")
+            .setSmallIcon(R.drawable.ic_notification_gate)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .build()
+
+        val manager = getSystemService(NotificationManager::class.java)
+        // Unique ID per host to allow multiple simultaneous verifications
+        manager.notify(config.host.hashCode(), notification)
+    }
+
     private fun stopConfig(configId: String) {
         activeJobs[configId]?.cancel()
         activeClients[configId]?.disconnect()
@@ -235,8 +278,12 @@ class SshForegroundService : Service() {
                 } else {
                     updateSummaryNotification()
                     if (config?.isEnabled == true) {
-                        delay(5000)
-                        startConfig(config)
+                        val isPending =
+                            HostKeyVerifierManager.pendingVerifications.containsKey(config.host)
+                        if (!isPending) {
+                            delay(5000)
+                            startConfig(config)
+                        }
                     }
                 }
             }
@@ -245,13 +292,32 @@ class SshForegroundService : Service() {
 
     private suspend fun establishTunnel(config: SshConfig) = withContext(Dispatchers.IO) {
         val client = SSHClient()
+        activeClients[config.id] = client
+
         try {
-            client.addHostKeyVerifier(PromiscuousVerifier())
+            val verifierManager = HostKeyVerifierManager(this@SshForegroundService)
+            client.addHostKeyVerifier(verifierManager.getVerifier())
+
             client.connectTimeout = 10000
             client.timeout = 15000
 
             LogRepository.log("Gate [${config.name}]: Connecting...")
-            client.connect(config.host, config.port)
+
+            try {
+                client.connect(config.host, config.port)
+            } catch (e: Exception) {
+                var cause: Throwable? = e
+                while (cause != null) {
+                    if (cause is HostKeyVerificationException) {
+                        HostKeyVerifierManager.pendingVerifications[config.host] = cause
+                        showVerificationNotification(config)
+                        LogRepository.log("Gate [${config.name}]: Host verification required.")
+                        throw cause
+                    }
+                    cause = cause.cause
+                }
+                throw e
+            }
 
             config.keyAlias?.let { alias ->
                 LogRepository.log("Gate [${config.name}]: Authenticating...")
@@ -265,7 +331,6 @@ class SshForegroundService : Service() {
             client.connection.keepAlive.keepAliveInterval = config.keepAliveInterval
 
             if (client.isAuthenticated) {
-                activeClients[config.id] = client
                 LogRepository.log("Gate Open: ${config.name}")
                 updateSummaryNotification()
 
@@ -291,45 +356,50 @@ class SshForegroundService : Service() {
             }
         } catch (e: Exception) {
             if (isActive) {
-                LogRepository.log("Gate [${config.name}] error: ${e.message ?: "Unknown error"}")
+                if (e !is HostKeyVerificationException) {
+                    LogRepository.log("Gate [${config.name}] error: ${e.message ?: "Unknown error"}")
+                }
                 throw e
             }
         } finally {
             try {
                 client.disconnect()
             } catch (e: Exception) {
+                Log.w(TAG, "Error disconnecting client", e)
             }
+            activeClients.remove(config.id)
         }
     }
 
     private suspend fun runSocks5Server(configId: String, ssh: SSHClient, port: Int) =
         withContext(Dispatchers.IO) {
             var serverSocket: ServerSocket? = null
-            var retries = 5
-            while (retries > 0 && isActive) {
-                try {
-                    serverSocket = ServerSocket()
-                    serverSocket.reuseAddress = true
-                    serverSocket.bind(InetSocketAddress("127.0.0.1", port))
-                    activeProxies[configId] = serverSocket
-                    Log.d(TAG, "SOCKS5 Proxy ready on port $port")
-                    break
-                } catch (e: java.net.BindException) {
-                    serverSocket?.close()
-                    retries--
-                    if (retries > 0) {
-                        delay(1000)
-                    } else {
-                        LogRepository.log("Proxy Error: Port $port is in use.")
-                        return@withContext
+            try {
+                var retries = 5
+                while (retries > 0 && isActive) {
+                    try {
+                        serverSocket = ServerSocket()
+                        serverSocket.reuseAddress = true
+                        serverSocket.bind(InetSocketAddress("127.0.0.1", port))
+                        activeProxies[configId] = serverSocket
+                        Log.d(TAG, "SOCKS5 Proxy ready on port $port")
+                        break
+                    } catch (e: java.net.BindException) {
+                        serverSocket?.close()
+                        serverSocket = null
+                        retries--
+                        if (retries > 0) {
+                            delay(1000)
+                        } else {
+                            LogRepository.log("Proxy Error: Port $port is in use.")
+                            return@withContext
+                        }
                     }
                 }
-            }
 
-            try {
                 while (isActive && serverSocket?.isClosed == false) {
                     val clientSocket = try {
-                        serverSocket.accept()
+                        serverSocket?.accept()
                     } catch (e: Exception) {
                         null
                     }
@@ -353,13 +423,27 @@ class SshForegroundService : Service() {
                     val input = s.getInputStream()
                     val output = s.getOutputStream()
 
-                    if (input.read() != 5) return@withContext
+                    // Bounds check for initial greeting
+                    val version = input.read()
+                    if (version != 5) return@withContext
+
                     val nMethods = input.read()
-                    input.skip(nMethods.toLong())
+                    if (nMethods <= 0) return@withContext
+
+                    val methods = ByteArray(nMethods)
+                    var methodsRead = 0
+                    while (methodsRead < nMethods) {
+                        val read = input.read(methods, methodsRead, nMethods - methodsRead)
+                        if (read == -1) return@withContext
+                        methodsRead += read
+                    }
+
                     output.write(byteArrayOf(5, 0))
                     output.flush()
 
-                    if (input.read() != 5) return@withContext
+                    // Request
+                    val ver = input.read()
+                    if (ver != 5) return@withContext
                     val cmd = input.read()
                     input.read() // RSV
                     val atyp = input.read()
@@ -373,10 +457,16 @@ class SshForegroundService : Service() {
 
                         3 -> {
                             val len = input.read()
-                            if (len == -1) return@withContext
+                            if (len <= 0) return@withContext
                             val addr = ByteArray(len)
                             input.readFully(addr)
                             String(addr)
+                        }
+
+                        4 -> { // IPv6
+                            val addr = ByteArray(16)
+                            input.readFully(addr)
+                            java.net.InetAddress.getByAddress(addr).hostAddress
                         }
 
                         else -> return@withContext
@@ -424,11 +514,6 @@ class SshForegroundService : Service() {
             }
         } catch (e: Exception) {
         }
-    }
-
-    private fun updateNotification(content: String) {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, createNotification(content))
     }
 
     private fun stopServiceInternal() {
