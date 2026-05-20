@@ -29,6 +29,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".HostKeyApprovalActivity"
+            android:theme="@style/Theme.MaterialComponents.Light.Dialog"
+            android:exported="false" />
+
         <service
             android:name=".SshForegroundService"
             android:enabled="true"

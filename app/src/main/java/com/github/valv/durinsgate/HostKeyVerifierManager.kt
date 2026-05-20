@@ -1,29 +1,87 @@
 package com.github.valv.durinsgate
 
 import android.content.Context
+import android.util.Base64
 import android.util.Log
+import net.schmizz.sshj.common.Buffer
+import net.schmizz.sshj.common.KeyType
+import net.schmizz.sshj.transport.verification.HostKeyVerifier
 import net.schmizz.sshj.transport.verification.OpenSSHKnownHosts
 import java.io.File
+import java.security.PublicKey
+import java.util.concurrent.ConcurrentHashMap
+
+class HostKeyVerificationException(
+    val hostname: String,
+    val port: Int,
+    val publicKey: PublicKey,
+    val isMismatch: Boolean
+) : Exception("Host key verification failed for $hostname")
 
 class HostKeyVerifierManager(private val context: Context) {
     private val knownHostsFile = File(context.filesDir, "known_hosts")
 
-    fun getVerifier(): OpenSSHKnownHosts {
-        // Create known_hosts file if it doesn't exist
+    fun getVerifier(): HostKeyVerifier {
         if (!knownHostsFile.exists()) {
             knownHostsFile.createNewFile()
         }
-        return OpenSSHKnownHosts(knownHostsFile)
+        val delegate = OpenSSHKnownHosts(knownHostsFile)
+
+        return object : HostKeyVerifier {
+            override fun verify(hostname: String, port: Int, key: PublicKey): Boolean {
+                val result = delegate.verify(hostname, port, key)
+                if (!result) {
+                    val isMismatch = isHostKnown(hostname)
+                    throw HostKeyVerificationException(hostname, port, key, isMismatch)
+                }
+                return true
+            }
+
+            override fun findExistingAlgorithms(hostname: String?, port: Int): MutableList<String> {
+                return delegate.findExistingAlgorithms(hostname, port)
+            }
+        }
     }
 
-    fun addHostKey(hostname: String, port: Int, publicKey: String) {
+    fun addHostKey(hostname: String, port: Int, publicKey: PublicKey) {
         try {
             if (!knownHostsFile.exists()) {
                 knownHostsFile.createNewFile()
             }
-            val entry = "[$hostname]:$port $publicKey"
-            knownHostsFile.appendText("$entry\n")
-            Log.i("HostKeyVerifier", "Host key added for $hostname:$port")
+
+            val kt = KeyType.fromKey(publicKey)
+            // SSHJ KeyType in some versions might not have sshName.
+            // We can try to use a mapping or check if there's a getter.
+            // For 0.40.0, let's use a safe mapping.
+            val typeName = when (kt) {
+                KeyType.RSA -> "ssh-rsa"
+                KeyType.DSA -> "ssh-dss"
+                KeyType.ECDSA256 -> "ecdsa-sha2-nistp256"
+                KeyType.ECDSA384 -> "ecdsa-sha2-nistp384"
+                KeyType.ECDSA521 -> "ecdsa-sha2-nistp521"
+                KeyType.ED25519 -> "ssh-ed25519"
+                else -> kt.toString().lowercase()
+            }
+
+            val buffer = Buffer.PlainBuffer().putPublicKey(publicKey)
+            val keyBlob = Base64.encodeToString(
+                buffer.array(),
+                buffer.rpos(),
+                buffer.available(),
+                Base64.NO_WRAP
+            )
+
+            val entry = "[$hostname]:$port $typeName $keyBlob"
+
+            synchronized(this) {
+                val lines = if (knownHostsFile.exists()) knownHostsFile.readLines() else emptyList()
+                val filteredLines = lines.filter { !it.contains("[$hostname]:$port") }
+                val newContent = filteredLines.toMutableList()
+                newContent.add(entry)
+                knownHostsFile.writeText(newContent.joinToString("\n") + "\n")
+            }
+
+            Log.i("HostKeyVerifier", "Host key added/updated for $hostname:$port")
         } catch (e: Exception) {
             Log.e("HostKeyVerifier", "Failed to add host key", e)
         }
@@ -31,11 +89,19 @@ class HostKeyVerifierManager(private val context: Context) {
 
     fun isHostKnown(hostname: String): Boolean {
         return try {
-            val verifier = getVerifier()
-            // Check if any entry exists for this host
-            knownHostsFile.readLines().any { it.contains(hostname) }
+            if (!knownHostsFile.exists()) return false
+            knownHostsFile.readLines().any { it.contains("[$hostname]") }
         } catch (e: Exception) {
             false
+        }
+    }
+
+    companion object {
+        // Support multiple pending verifications simultaneously
+        val pendingVerifications = ConcurrentHashMap<String, HostKeyVerificationException>()
+
+        fun getFingerprint(key: PublicKey): String {
+            return net.schmizz.sshj.common.SecurityUtils.getFingerprint(key)
         }
     }
 }

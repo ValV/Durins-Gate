@@ -28,14 +28,17 @@ class KeyManager(private val context: Context) {
     }
 
     companion object {
+        private val lock = Any()
+
         fun setupBouncyCastle() {
-            val provider = Security.getProvider(BouncyCastleProvider.PROVIDER_NAME)
-            if (provider == null) {
-                Security.addProvider(BouncyCastleProvider())
-            } else if (provider !is BouncyCastleProvider) {
-                // If the system provider has the same name, we need to insert ours at the top
-                Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
-                Security.insertProviderAt(BouncyCastleProvider(), 1)
+            synchronized(lock) {
+                val provider = Security.getProvider(BouncyCastleProvider.PROVIDER_NAME)
+                if (provider == null) {
+                    Security.addProvider(BouncyCastleProvider())
+                } else if (provider !is BouncyCastleProvider) {
+                    Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
+                    Security.insertProviderAt(BouncyCastleProvider(), 1)
+                }
             }
         }
     }
@@ -44,7 +47,7 @@ class KeyManager(private val context: Context) {
         if (!exists()) mkdirs()
     }
 
-    fun generateRSAKey(alias: String, bits: Int = 4096): String {
+    fun generateRSAKey(alias: String, bits: Int = 4096): String = synchronized(lock) {
         return try {
             val generator = RSAKeyPairGenerator()
             generator.init(
@@ -64,7 +67,7 @@ class KeyManager(private val context: Context) {
         }
     }
 
-    fun generateEd25519Key(alias: String): String {
+    fun generateEd25519Key(alias: String): String = synchronized(lock) {
         return try {
             val generator = Ed25519KeyPairGenerator()
             generator.init(Ed25519KeyGenerationParameters(SecureRandom()))
@@ -81,7 +84,6 @@ class KeyManager(private val context: Context) {
         val privateKeyFile = File(keysDir, alias)
         val publicKeyFile = File(keysDir, "$alias.pub")
 
-        // Save Private Key in PEM format
         val privateKeyInfo = PrivateKeyInfoFactory.createPrivateKeyInfo(keyPair.private)
         val sw = StringWriter()
         val pemWriter = JcaPEMWriter(sw)
@@ -89,7 +91,6 @@ class KeyManager(private val context: Context) {
         pemWriter.close()
         privateKeyFile.writeText(sw.toString())
 
-        // Save Public Key in OpenSSH format
         val out = ByteArrayOutputStream()
         val dos = DataOutputStream(out)
 
@@ -129,52 +130,32 @@ class KeyManager(private val context: Context) {
         dos.write(bytes)
     }
 
-    fun listKeys(): List<String> =
+    fun listKeys(): List<String> = synchronized(lock) {
         keysDir.listFiles { _, name -> !name.endsWith(".pub") }?.map { it.name } ?: emptyList()
+    }
 
     fun getPrivateKeyPath(alias: String): String = File(keysDir, alias).absolutePath
-    fun getPublicKey(alias: String): String =
-        File(keysDir, "$alias.pub").let { if (it.exists()) it.readText() else "" }
 
-    // ✅ BUG FIX #3: Atomic key deletion with error checking
-    fun deleteKey(alias: String): Boolean {
+    fun getPublicKey(alias: String): String = synchronized(lock) {
+        File(keysDir, "$alias.pub").let { if (it.exists()) it.readText() else "" }
+    }
+
+    fun deleteKey(alias: String): Boolean = synchronized(lock) {
         return try {
             val privateKeyFile = File(keysDir, alias)
             val publicKeyFile = File(keysDir, "$alias.pub")
 
-            var privateDeleted = false
-            var publicDeleted = false
+            val privateDeleted = if (privateKeyFile.exists()) privateKeyFile.delete() else true
+            val publicDeleted = if (publicKeyFile.exists()) publicKeyFile.delete() else true
 
-            try {
-                privateDeleted = privateKeyFile.delete()
-                if (!privateDeleted) {
-                    Log.w("KeyManager", "Failed to delete private key: $alias")
-                }
-            } catch (e: Exception) {
-                Log.e("KeyManager", "Exception deleting private key", e)
-            }
-
-            try {
-                publicDeleted = publicKeyFile.delete()
-                if (!publicDeleted) {
-                    Log.w("KeyManager", "Failed to delete public key: $alias")
-                }
-            } catch (e: Exception) {
-                Log.e("KeyManager", "Exception deleting public key", e)
-            }
-
-            // Both files must be deleted successfully
             if (privateDeleted && publicDeleted) {
                 Log.i("KeyManager", "Successfully deleted key pair: $alias")
                 true
             } else {
-                // Log orphaned files
-                if (privateDeleted && !publicDeleted) {
-                    Log.e("KeyManager", "Orphaned public key: $alias.pub")
-                }
-                if (!privateDeleted && publicDeleted) {
-                    Log.e("KeyManager", "Orphaned private key: $alias")
-                }
+                Log.e(
+                    "KeyManager",
+                    "Partial deletion for $alias: private=$privateDeleted, public=$publicDeleted"
+                )
                 false
             }
         } catch (e: Exception) {
@@ -183,16 +164,13 @@ class KeyManager(private val context: Context) {
         }
     }
 
-    // ✅ NEW: Verify key pair consistency
-    fun isKeyPairComplete(alias: String): Boolean {
+    fun isKeyPairComplete(alias: String): Boolean = synchronized(lock) {
         val privateKey = File(keysDir, alias)
         val publicKey = File(keysDir, "$alias.pub")
-
         return privateKey.exists() && publicKey.exists()
     }
 
-    // ✅ NEW: Clean up orphaned keys
-    fun cleanupOrphanedKeys() {
+    fun cleanupOrphanedKeys() = synchronized(lock) {
         keysDir.listFiles()?.forEach { file ->
             val baseName = file.name.removeSuffix(".pub")
             if (file.name.endsWith(".pub")) {
