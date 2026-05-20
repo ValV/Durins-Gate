@@ -13,6 +13,7 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.view.LayoutInflater
 import android.widget.ArrayAdapter
+import android.widget.ImageView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -33,6 +34,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: SshConfigAdapter
     private lateinit var keyManager: KeyManager
 
+    private var iconTapCount = 0
+    private var lastTapTime = 0L
+
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted: Boolean ->
@@ -50,6 +54,7 @@ class MainActivity : AppCompatActivity() {
         storage = ConfigStorage(this)
         keyManager = KeyManager(this)
 
+        setupToolbar()
         setupRecyclerView()
         setupLogs()
         checkPermissions()
@@ -59,6 +64,25 @@ class MainActivity : AppCompatActivity() {
         restoreTunnels()
 
         binding.fabAdd.setOnClickListener { showEditDialog(null) }
+    }
+
+    private fun setupToolbar() {
+        val icon = findViewById<ImageView>(R.id.iv_header_icon)
+        icon.setOnClickListener {
+            val currentTime = System.currentTimeMillis()
+            if (currentTime - lastTapTime > 2000) {
+                iconTapCount = 0
+            }
+            lastTapTime = currentTime
+            iconTapCount++
+
+            if (iconTapCount == 7) {
+                iconTapCount = 0
+                startActivity(Intent(this, AdvancedConfigActivity::class.java))
+            } else if (iconTapCount > 3) {
+                Toast.makeText(this, "You are ${7 - iconTapCount} steps away from advanced settings", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     private fun checkBatteryOptimizations() {

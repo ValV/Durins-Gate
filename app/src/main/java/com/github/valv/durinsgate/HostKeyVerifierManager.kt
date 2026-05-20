@@ -18,6 +18,13 @@ class HostKeyVerificationException(
     val isMismatch: Boolean
 ) : Exception("Host key verification failed for $hostname")
 
+data class KnownHostEntry(
+    val raw: String,
+    val host: String,
+    val type: String,
+    val fingerprint: String
+)
+
 class HostKeyVerifierManager(private val context: Context) {
     private val knownHostsFile = File(context.filesDir, "known_hosts")
 
@@ -50,9 +57,6 @@ class HostKeyVerifierManager(private val context: Context) {
             }
 
             val kt = KeyType.fromKey(publicKey)
-            // SSHJ KeyType in some versions might not have sshName.
-            // We can try to use a mapping or check if there's a getter.
-            // For 0.40.0, let's use a safe mapping.
             val typeName = when (kt) {
                 KeyType.RSA -> "ssh-rsa"
                 KeyType.DSA -> "ssh-dss"
@@ -96,8 +100,28 @@ class HostKeyVerifierManager(private val context: Context) {
         }
     }
 
+    fun getKnownHosts(): List<KnownHostEntry> {
+        if (!knownHostsFile.exists()) return emptyList()
+        return knownHostsFile.readLines().filter { it.isNotBlank() }.map { line ->
+            val parts = line.split(" ")
+            val host = parts.getOrNull(0) ?: "Unknown"
+            val type = parts.getOrNull(1) ?: ""
+            // We could parse the key to get fingerprint, but maybe just showing the host is enough for now
+            // or we use a placeholder if we don't want to parse it here.
+            KnownHostEntry(line, host, type, "")
+        }
+    }
+
+    fun removeHostKey(rawLine: String) {
+        synchronized(this) {
+            if (!knownHostsFile.exists()) return
+            val lines = knownHostsFile.readLines()
+            val filteredLines = lines.filter { it != rawLine }
+            knownHostsFile.writeText(filteredLines.joinToString("\n") + if (filteredLines.isNotEmpty()) "\n" else "")
+        }
+    }
+
     companion object {
-        // Support multiple pending verifications simultaneously
         val pendingVerifications = ConcurrentHashMap<String, HostKeyVerificationException>()
 
         fun getFingerprint(key: PublicKey): String {
