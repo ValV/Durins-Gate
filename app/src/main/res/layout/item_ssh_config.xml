@@ -1,12 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<androidx.cardview.widget.CardView xmlns:android="http://schemas.android.com/apk/res/android"
+<com.google.android.material.card.MaterialCardView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:layout_margin="8dp"
-    app:cardCornerRadius="8dp"
+    app:cardBackgroundColor="@color/stone_mid"
+    app:cardCornerRadius="12dp"
     app:cardElevation="4dp"
-    app:cardBackgroundColor="#1E1E1E">
+    app:strokeColor="@color/stone_light"
+    app:strokeWidth="1dp">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -14,52 +16,63 @@
         android:orientation="vertical"
         android:padding="16dp">
 
-        <TextView
-            android:id="@+id/tvName"
+        <RelativeLayout
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Server Name"
-            android:textSize="18sp"
-            android:textStyle="bold"
-            android:textColor="#FFFFFF" />
+            android:layout_height="wrap_content">
+
+            <TextView
+                android:id="@+id/tvName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Moria Tunnel"
+                android:textColor="@color/gold_bright"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <ImageButton
+                android:id="@+id/btnKey"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:layout_alignParentEnd="true"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Copy Key"
+                android:src="@android:drawable/ic_menu_set_as"
+                app:tint="@color/gold_pale" />
+        </RelativeLayout>
 
         <TextView
             android:id="@+id/tvDetails"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="user@host:port"
-            android:textColor="#AAAAAA" />
+            android:text="root@khazad-dum:22 -> :1080"
+            android:textColor="@color/gold_pale"
+            android:textSize="14sp" />
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:orientation="horizontal"
-            android:gravity="end">
-
-            <Button
-                android:id="@+id/btnKey"
-                style="?android:attr/borderlessButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Key"
-                android:textColor="#BBBBBB" />
+            android:layout_marginTop="16dp"
+            android:gravity="end"
+            android:orientation="horizontal">
 
             <Button
                 android:id="@+id/btnEdit"
-                style="?android:attr/borderlessButtonStyle"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Edit"
-                android:textColor="#BBBBBB" />
+                android:textColor="@color/gold_primary" />
 
             <Button
                 android:id="@+id/btnConnect"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="8dp"
-                android:text="Connect" />
+                android:backgroundTint="@color/gold_deep"
+                android:text="Connect"
+                android:textColor="@color/void_deep" />
         </LinearLayout>
+
     </LinearLayout>
-</androidx.cardview.widget.CardView>
+</com.google.android.material.card.MaterialCardView>

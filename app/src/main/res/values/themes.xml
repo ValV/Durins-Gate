@@ -1,12 +1,26 @@
 <resources>
+    <!-- Base application theme. -->
+    <style name="Theme.DurinsGate" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+        <item name="colorPrimary">@color/gold_primary</item>
+        <item name="colorPrimaryVariant">@color/gold_deep</item>
+        <item name="colorOnPrimary">@color/void_deep</item>
 
-    <style name="Theme.DurinsGate" parent="Theme.AppCompat.Light.DarkActionBar">
-        <!-- Primary brand color. -->
-        <item name="colorPrimary">@color/purple_500</item>
-        <item name="colorPrimaryDark">@color/purple_700</item>
-        <item name="colorAccent">@color/teal_200</item>
+        <item name="colorSecondary">@color/light_warm</item>
+        <item name="colorSecondaryVariant">@color/light_outer</item>
+        <item name="colorOnSecondary">@color/void_deep</item>
 
-        <!-- Ensure standard attributes are set -->
-        <item name="android:windowBackground">@color/white</item>
+        <item name="android:statusBarColor">@color/void_deep</item>
+        <item name="android:windowBackground">@color/stone_dark</item>
+
+        <item name="colorSurface">@color/stone_mid</item>
+        <item name="colorOnSurface">@color/gold_pale</item>
+    </style>
+
+    <!-- Splash Screen Theme to fix the "White Fill" issue -->
+    <style name="Theme.DurinsGate.Starting" parent="Theme.DurinsGate">
+        <item name="android:windowBackground">@color/void_deep</item>
+        <!-- Fix for Android 12+ splash icon background -->
+        <item name="android:windowSplashScreenBackground">@color/void_deep</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_durins_gate</item>
     </style>
 </resources>

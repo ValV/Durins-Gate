@@ -3,7 +3,7 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#121212">
+    android:background="@color/stone_dark">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -20,7 +20,7 @@
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"
-            android:background="#333333" />
+            android:background="@color/stone_light" />
 
         <TextView
             android:layout_width="match_parent"
@@ -28,21 +28,21 @@
             android:padding="8dp"
             android:text="Connection Logs"
             android:textStyle="bold"
-            android:textColor="#BBBBBB"
-            android:background="#1E1E1E"/>
+            android:textColor="@color/gold_pale"
+            android:background="@color/stone_mid"/>
 
         <ScrollView
             android:id="@+id/logScrollView"
             android:layout_width="match_parent"
             android:layout_height="180dp"
-            android:background="#000000"
+            android:background="@color/void_deep"
             android:padding="8dp">
             <TextView
                 android:id="@+id/tvLogs"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:fontFamily="monospace"
-                android:textColor="#00FF00"
+                android:textColor="@color/accent_success"
                 android:textSize="12sp"
                 android:text="Waiting for connection..." />
         </ScrollView>
@@ -56,7 +56,7 @@
         android:layout_margin="16dp"
         app:srcCompat="@android:drawable/ic_input_add"
         android:contentDescription="Add Configuration"
-        app:backgroundTint="@color/purple_500"
-        app:tint="#FFFFFF"/>
+        app:backgroundTint="@color/gold_primary"
+        app:tint="@color/void_deep"/>
 
 </androidx.coordinatorlayout.widget.CoordinatorLayout>

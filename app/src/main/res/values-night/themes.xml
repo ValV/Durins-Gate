@@ -2,15 +2,20 @@
     <!-- Base application theme. -->
     <style name="Theme.DurinsGate" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
         <!-- Primary brand color. -->
-        <item name="colorPrimary">@color/purple_200</item>
-        <item name="colorPrimaryVariant">@color/purple_700</item>
-        <item name="colorOnPrimary">@color/black</item>
+        <item name="colorPrimary">@color/gold_primary</item>
+        <item name="colorPrimaryVariant">@color/gold_deep</item>
+        <item name="colorOnPrimary">@color/void_deep</item>
         <!-- Secondary brand color. -->
-        <item name="colorSecondary">@color/teal_200</item>
-        <item name="colorSecondaryVariant">@color/teal_200</item>
-        <item name="colorOnSecondary">@color/black</item>
+        <item name="colorSecondary">@color/light_warm</item>
+        <item name="colorSecondaryVariant">@color/light_outer</item>
+        <item name="colorOnSecondary">@color/void_deep</item>
+
         <!-- Status bar color. -->
-        <item name="android:statusBarColor">?attr/colorPrimaryVariant</item>
+        <item name="android:statusBarColor">@color/void_deep</item>
+
         <!-- Customize your theme here. -->
+        <item name="android:windowBackground">@color/void_deep</item>
+        <item name="colorSurface">@color/stone_mid</item>
+        <item name="colorOnSurface">@color/gold_pale</item>
     </style>
 </resources>
