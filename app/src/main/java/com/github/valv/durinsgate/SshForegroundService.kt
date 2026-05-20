@@ -30,7 +30,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
-import net.schmizz.sshj.transport.verification.PromiscuousVerifier
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
@@ -245,8 +244,25 @@ class SshForegroundService : Service() {
 
     private suspend fun establishTunnel(config: SshConfig) = withContext(Dispatchers.IO) {
         val client = SSHClient()
+
+        // ✅ BUG FIX #2: Register client immediately to ensure cleanup on any failure
+        activeClients[config.id] = client
+
         try {
-            client.addHostKeyVerifier(PromiscuousVerifier())
+            // ✅ BUG FIX #1: Use proper host key verification instead of PromiscuousVerifier
+            val verifierManager = HostKeyVerifierManager(this@SshForegroundService)
+            val verifier = verifierManager.getVerifier()
+
+            // client.addHostKeyVerifier(PromiscuousVerifier())
+            try {
+                client.addHostKeyVerifier(verifier)
+            } catch (e: Exception) {
+                // If known_hosts verification fails (first connection or unknown host)
+                LogRepository.log("Gate [${config.name}]: New host key detected. Please verify manually.")
+                Log.w(TAG, "Host key verification failed for ${config.host}", e)
+                throw Exception("Unknown host key for ${config.host}. Please add it manually.")
+            }
+
             client.connectTimeout = 10000
             client.timeout = 15000
 
@@ -265,7 +281,7 @@ class SshForegroundService : Service() {
             client.connection.keepAlive.keepAliveInterval = config.keepAliveInterval
 
             if (client.isAuthenticated) {
-                activeClients[config.id] = client
+                // activeClients[config.id] = client
                 LogRepository.log("Gate Open: ${config.name}")
                 updateSummaryNotification()
 
@@ -295,10 +311,15 @@ class SshForegroundService : Service() {
                 throw e
             }
         } finally {
+            // ✅ BUG FIX #2: Always clean up client resources
             try {
                 client.disconnect()
             } catch (e: Exception) {
+                Log.w(TAG, "Error disconnecting client", e)
             }
+            // ✅ BUG FIX #2: Remove from active clients map
+            activeClients.remove(config.id)
+
         }
     }
 

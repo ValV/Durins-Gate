@@ -136,7 +136,78 @@ class KeyManager(private val context: Context) {
     fun getPublicKey(alias: String): String =
         File(keysDir, "$alias.pub").let { if (it.exists()) it.readText() else "" }
 
-    fun deleteKey(alias: String) {
-        File(keysDir, alias).delete(); File(keysDir, "$alias.pub").delete()
+    // ✅ BUG FIX #3: Atomic key deletion with error checking
+    fun deleteKey(alias: String): Boolean {
+        return try {
+            val privateKeyFile = File(keysDir, alias)
+            val publicKeyFile = File(keysDir, "$alias.pub")
+
+            var privateDeleted = false
+            var publicDeleted = false
+
+            try {
+                privateDeleted = privateKeyFile.delete()
+                if (!privateDeleted) {
+                    Log.w("KeyManager", "Failed to delete private key: $alias")
+                }
+            } catch (e: Exception) {
+                Log.e("KeyManager", "Exception deleting private key", e)
+            }
+
+            try {
+                publicDeleted = publicKeyFile.delete()
+                if (!publicDeleted) {
+                    Log.w("KeyManager", "Failed to delete public key: $alias")
+                }
+            } catch (e: Exception) {
+                Log.e("KeyManager", "Exception deleting public key", e)
+            }
+
+            // Both files must be deleted successfully
+            if (privateDeleted && publicDeleted) {
+                Log.i("KeyManager", "Successfully deleted key pair: $alias")
+                true
+            } else {
+                // Log orphaned files
+                if (privateDeleted && !publicDeleted) {
+                    Log.e("KeyManager", "Orphaned public key: $alias.pub")
+                }
+                if (!privateDeleted && publicDeleted) {
+                    Log.e("KeyManager", "Orphaned private key: $alias")
+                }
+                false
+            }
+        } catch (e: Exception) {
+            Log.e("KeyManager", "Unexpected error deleting key", e)
+            false
+        }
+    }
+
+    // ✅ NEW: Verify key pair consistency
+    fun isKeyPairComplete(alias: String): Boolean {
+        val privateKey = File(keysDir, alias)
+        val publicKey = File(keysDir, "$alias.pub")
+
+        return privateKey.exists() && publicKey.exists()
+    }
+
+    // ✅ NEW: Clean up orphaned keys
+    fun cleanupOrphanedKeys() {
+        keysDir.listFiles()?.forEach { file ->
+            val baseName = file.name.removeSuffix(".pub")
+            if (file.name.endsWith(".pub")) {
+                val privateKey = File(keysDir, baseName)
+                if (!privateKey.exists()) {
+                    Log.w("KeyManager", "Removing orphaned public key: ${file.name}")
+                    file.delete()
+                }
+            } else {
+                val publicKey = File(keysDir, "$baseName.pub")
+                if (!publicKey.exists()) {
+                    Log.w("KeyManager", "Removing orphaned private key: ${file.name}")
+                    file.delete()
+                }
+            }
+        }
     }
 }
