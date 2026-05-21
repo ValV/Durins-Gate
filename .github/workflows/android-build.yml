@@ -51,7 +51,7 @@ jobs:
             echo "Build Type: FEATURE"
             # Clean branch name for artifact safety
             SAFE_BRANCH="${REF_NAME//\//-}"
-            TAG="feat-${SAFE_BRANCH}-${RUN_NUMBER}"
+            TAG="${SAFE_BRANCH}-b${RUN_NUMBER}"
             RELEASE_NAME="Feature Build #${RUN_NUMBER} ($REF_NAME)"
             IS_PRERELEASE="true"
             SHOULD_RELEASE="false"
