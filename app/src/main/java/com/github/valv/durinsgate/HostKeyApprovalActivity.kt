@@ -15,7 +15,9 @@ class HostKeyApprovalActivity : AppCompatActivity() {
 
         val hostname = intent.getStringExtra("hostname") ?: ""
         val configId = intent.getStringExtra(SshForegroundService.EXTRA_CONFIG_ID)
-        val exception = HostKeyVerifierManager.pendingVerifications[hostname]
+        // Fix 3 & 8: Access the exception from the Pair
+        val pair = HostKeyVerifierManager.pendingVerifications[hostname]
+        val exception = pair?.first
 
         if (exception == null) {
             finish()

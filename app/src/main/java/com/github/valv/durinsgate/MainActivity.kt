@@ -145,8 +145,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startSshService(config: SshConfig) {
-        val intent =
-            Intent(this, SshForegroundService::class.java).apply { putExtra("config", config) }
+        // Fix 7: Pass only the config ID
+        val intent = Intent(this, SshForegroundService::class.java).apply {
+            putExtra(SshForegroundService.EXTRA_CONFIG_ID, config.id)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(
             intent
         )

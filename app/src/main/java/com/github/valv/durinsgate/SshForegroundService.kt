@@ -56,6 +56,9 @@ class SshForegroundService : Service() {
         const val ACTION_RETRY_CONFIG = "RETRY_CONFIG"
         const val EXTRA_CONFIG_ID = "config_id"
 
+        // Fix 8: Timeout for pending verifications
+        private const val VERIFICATION_TIMEOUT_MS = 5 * 60 * 1000L // 5 minutes
+
         private val _activeConfigIds = mutableSetOf<String>()
         val activeConfigIds: Set<String> get() = synchronized(_activeConfigIds) { _activeConfigIds.toSet() }
 
@@ -124,15 +127,13 @@ class SshForegroundService : Service() {
             }
         }
 
-        val config = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent.getSerializableExtra("config", SshConfig::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getSerializableExtra("config") as? SshConfig
-        }
-
-        if (config != null) {
-            startConfig(config)
+        // Fix 7: Use EXTRA_CONFIG_ID instead of serialized object
+        val configId = intent.getStringExtra(EXTRA_CONFIG_ID)
+        if (configId != null) {
+            serviceScope.launch {
+                val storage = ConfigStorage(this@SshForegroundService)
+                storage.loadConfigs().find { it.id == configId }?.let { startConfig(it) }
+            }
         } else {
             restoreTunnelsFromStorage()
         }
@@ -158,7 +159,7 @@ class SshForegroundService : Service() {
     private fun startConfig(config: SshConfig) {
         if (isConfigActive(config.id)) return
 
-        synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
+        // Fix 1: Config ID is added only after successful authentication in establishTunnel
 
         if (wakeLock?.isHeld == false) {
             try {
@@ -240,6 +241,19 @@ class SshForegroundService : Service() {
         manager.notify(config.host.hashCode(), notification)
     }
 
+    // Fix 5: Proxy error notification
+    private fun showProxyErrorNotification(config: SshConfig, port: Int) {
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Proxy Error")
+            .setContentText("Gate [${config.name}]: SOCKS5 proxy failed to bind to port $port.")
+            .setSmallIcon(R.drawable.ic_notification_gate)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(config.id.hashCode() + 1000, notification)
+    }
+
     private fun stopConfig(configId: String) {
         activeJobs[configId]?.cancel()
         activeClients[configId]?.disconnect()
@@ -278,9 +292,15 @@ class SshForegroundService : Service() {
                 } else {
                     updateSummaryNotification()
                     if (config?.isEnabled == true) {
-                        val isPending =
-                            HostKeyVerifierManager.pendingVerifications.containsKey(config.host)
-                        if (!isPending) {
+                        // Fix 3 & 8: Verification timeout and stale check
+                        val pending = HostKeyVerifierManager.pendingVerifications[config.host]
+                        val isPending = pending != null
+                        val isStale = isPending && (System.currentTimeMillis() - (pending?.second ?: 0L) > VERIFICATION_TIMEOUT_MS)
+
+                        if (!isPending || isStale) {
+                            if (isStale) {
+                                HostKeyVerifierManager.pendingVerifications.remove(config.host)
+                            }
                             delay(5000)
                             startConfig(config)
                         }
@@ -309,7 +329,8 @@ class SshForegroundService : Service() {
                 var cause: Throwable? = e
                 while (cause != null) {
                     if (cause is HostKeyVerificationException) {
-                        HostKeyVerifierManager.pendingVerifications[config.host] = cause
+                        // Fix 3: Track timestamp
+                        HostKeyVerifierManager.pendingVerifications[config.host] = Pair(cause, System.currentTimeMillis())
                         showVerificationNotification(config)
                         LogRepository.log("Gate [${config.name}]: Host verification required.")
                         throw cause
@@ -332,12 +353,14 @@ class SshForegroundService : Service() {
 
             if (client.isAuthenticated) {
                 LogRepository.log("Gate Open: ${config.name}")
+                // Fix 1: Add to active set only after successful authentication
+                synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
                 updateSummaryNotification()
 
                 coroutineScope {
                     var proxyJob: Job? = null
                     if (config.isSocks5) {
-                        proxyJob = launch { runSocks5Server(config.id, client, config.localPort) }
+                        proxyJob = launch { runSocks5Server(config, client, config.localPort) }
                     }
 
                     try {
@@ -371,7 +394,7 @@ class SshForegroundService : Service() {
         }
     }
 
-    private suspend fun runSocks5Server(configId: String, ssh: SSHClient, port: Int) =
+    private suspend fun runSocks5Server(config: SshConfig, ssh: SSHClient, port: Int) =
         withContext(Dispatchers.IO) {
             var serverSocket: ServerSocket? = null
             try {
@@ -381,7 +404,7 @@ class SshForegroundService : Service() {
                         serverSocket = ServerSocket()
                         serverSocket.reuseAddress = true
                         serverSocket.bind(InetSocketAddress("127.0.0.1", port))
-                        activeProxies[configId] = serverSocket
+                        activeProxies[config.id] = serverSocket
                         Log.d(TAG, "SOCKS5 Proxy ready on port $port")
                         break
                     } catch (e: java.net.BindException) {
@@ -391,7 +414,9 @@ class SshForegroundService : Service() {
                         if (retries > 0) {
                             delay(1000)
                         } else {
-                            LogRepository.log("Proxy Error: Port $port is in use.")
+                            // Fix 5: Explicit log and notification
+                            LogRepository.log("Gate [${config.name}]: SOCKS5 proxy failed to bind to port $port after 5 retries")
+                            showProxyErrorNotification(config, port)
                             return@withContext
                         }
                     }
@@ -408,7 +433,7 @@ class SshForegroundService : Service() {
                     }
                 }
             } finally {
-                activeProxies.remove(configId)
+                activeProxies.remove(config.id)
                 try {
                     serverSocket?.close()
                 } catch (e: Exception) {
@@ -456,8 +481,9 @@ class SshForegroundService : Service() {
                         }
 
                         3 -> {
+                            // Fix 4: Size limits in SOCKS5
                             val len = input.read()
-                            if (len <= 0) return@withContext
+                            if (len <= 0 || len > 255) return@withContext
                             val addr = ByteArray(len)
                             input.readFully(addr)
                             String(addr)
@@ -489,6 +515,8 @@ class SshForegroundService : Service() {
                         }
                     }
                 } catch (e: Exception) {
+                    // Fix 6: Pipe error handling
+                    Log.w(TAG, "SOCKS5 request error: ${e.message}")
                 }
             }
         }
@@ -513,6 +541,8 @@ class SshForegroundService : Service() {
                 }
             }
         } catch (e: Exception) {
+            // Fix 6: Pipe error handling
+            Log.w(TAG, "Pipe error during SOCKS5 forwarding: ${e.message}")
         }
     }
 
