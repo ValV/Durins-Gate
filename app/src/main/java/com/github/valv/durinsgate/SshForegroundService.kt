@@ -292,7 +292,7 @@ class SshForegroundService : Service() {
                         // Fix 3 & 8: Verification timeout and stale check
                         val pending = HostKeyVerifierManager.pendingVerifications[config.host]
                         val isPending = pending != null
-                        val isStale = isPending && (System.currentTimeMillis() - pending.second > config.timeoutVerification)
+                        val isStale = isPending && (System.currentTimeMillis() - pending.second > config.verificationExpiry)
 
                         if (!isPending || isStale) {
                             if (isStale) {
@@ -315,7 +315,7 @@ class SshForegroundService : Service() {
             val verifierManager = HostKeyVerifierManager(this@SshForegroundService)
             client.addHostKeyVerifier(verifierManager.getVerifier())
 
-            client.connectTimeout = config.timeoutConnecct
+            client.connectTimeout = config.timeoutConnect
             client.timeout = config.timeoutClient
 
             LogRepository.log("Gate [${config.name}]: Connecting...")
@@ -362,7 +362,7 @@ class SshForegroundService : Service() {
 
                     try {
                         while (isActive && client.isConnected) {
-                            delay(config.timeoutJob)
+                            delay(config.connectionCheckInterval)
                         }
                     } finally {
                         proxyJob?.cancelAndJoin()
@@ -395,7 +395,7 @@ class SshForegroundService : Service() {
         withContext(Dispatchers.IO) {
             var serverSocket: ServerSocket? = null
             try {
-                var retries = config.keepAliveRetries
+                var retries = config.socks5BindRetries
                 while (retries > 0 && isActive) {
                     try {
                         serverSocket = ServerSocket()
@@ -409,11 +409,11 @@ class SshForegroundService : Service() {
                         serverSocket = null
                         retries--
                         if (retries > 0) {
-                            delay(config.timeoutRetry)
+                            delay(config.socks5BindRetryDelay)
                         } else {
                             // Fix 5: Explicit log and notification
                             LogRepository.log(
-                                "Gate [${config.name}]: SOCKS5 proxy failed to bind to port $port after ${config.keepAliveRetries} retries"
+                                "Gate [${config.name}]: SOCKS5 proxy failed to bind to port $port after ${config.socks5BindRetries} retries"
                             )
                             showProxyErrorNotification(config, port)
                             return@withContext
