@@ -12,5 +12,14 @@ data class SshConfig(
     var isSocks5: Boolean = true,
     var keyAlias: String? = null,
     var keepAliveInterval: Int = 60,
+    var keepAliveRetries: Int = 2,
+    var timeoutRetry: Long = 1000,
+    var timeoutConnecct: Int = 10000,
+    var timeoutClient: Int = 15000,
+    var timeoutJob: Long = 2000,
+    var timeoutWakeLock: Long = 3600 * 1000L,
+    // Fix 8: Timeout for pending verifications
+    var timeoutVerification: Long = 5 * 60 * 1000L, // 5 minutes
+    var timeoutVerificationRetry: Long = 5000,
     var isEnabled: Boolean = false
 ) : Serializable

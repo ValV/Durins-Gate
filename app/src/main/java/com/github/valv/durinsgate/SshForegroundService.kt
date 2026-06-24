@@ -56,9 +56,6 @@ class SshForegroundService : Service() {
         const val ACTION_RETRY_CONFIG = "RETRY_CONFIG"
         const val EXTRA_CONFIG_ID = "config_id"
 
-        // Fix 8: Timeout for pending verifications
-        private const val VERIFICATION_TIMEOUT_MS = 5 * 60 * 1000L // 5 minutes
-
         private val _activeConfigIds = mutableSetOf<String>()
         val activeConfigIds: Set<String> get() = synchronized(_activeConfigIds) { _activeConfigIds.toSet() }
 
@@ -163,7 +160,7 @@ class SshForegroundService : Service() {
 
         if (wakeLock?.isHeld == false) {
             try {
-                wakeLock?.acquire(3600 * 1000L)
+                wakeLock?.acquire(config.timeoutWakeLock)
             } catch (e: Exception) {
             }
         }
@@ -295,13 +292,13 @@ class SshForegroundService : Service() {
                         // Fix 3 & 8: Verification timeout and stale check
                         val pending = HostKeyVerifierManager.pendingVerifications[config.host]
                         val isPending = pending != null
-                        val isStale = isPending && (System.currentTimeMillis() - (pending?.second ?: 0L) > VERIFICATION_TIMEOUT_MS)
+                        val isStale = isPending && (System.currentTimeMillis() - pending.second > config.timeoutVerification)
 
                         if (!isPending || isStale) {
                             if (isStale) {
                                 HostKeyVerifierManager.pendingVerifications.remove(config.host)
                             }
-                            delay(5000)
+                            delay(config.timeoutVerificationRetry)
                             startConfig(config)
                         }
                     }
@@ -318,8 +315,8 @@ class SshForegroundService : Service() {
             val verifierManager = HostKeyVerifierManager(this@SshForegroundService)
             client.addHostKeyVerifier(verifierManager.getVerifier())
 
-            client.connectTimeout = 10000
-            client.timeout = 15000
+            client.connectTimeout = config.timeoutConnecct
+            client.timeout = config.timeoutClient
 
             LogRepository.log("Gate [${config.name}]: Connecting...")
 
@@ -365,7 +362,7 @@ class SshForegroundService : Service() {
 
                     try {
                         while (isActive && client.isConnected) {
-                            delay(2000)
+                            delay(config.timeoutJob)
                         }
                     } finally {
                         proxyJob?.cancelAndJoin()
@@ -398,7 +395,7 @@ class SshForegroundService : Service() {
         withContext(Dispatchers.IO) {
             var serverSocket: ServerSocket? = null
             try {
-                var retries = 5
+                var retries = config.keepAliveRetries
                 while (retries > 0 && isActive) {
                     try {
                         serverSocket = ServerSocket()
@@ -412,10 +409,12 @@ class SshForegroundService : Service() {
                         serverSocket = null
                         retries--
                         if (retries > 0) {
-                            delay(1000)
+                            delay(config.timeoutRetry)
                         } else {
                             // Fix 5: Explicit log and notification
-                            LogRepository.log("Gate [${config.name}]: SOCKS5 proxy failed to bind to port $port after 5 retries")
+                            LogRepository.log(
+                                "Gate [${config.name}]: SOCKS5 proxy failed to bind to port $port after ${config.keepAliveRetries} retries"
+                            )
                             showProxyErrorNotification(config, port)
                             return@withContext
                         }
