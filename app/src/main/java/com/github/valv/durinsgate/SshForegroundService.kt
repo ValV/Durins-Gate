@@ -155,32 +155,34 @@ class SshForegroundService : Service() {
     }
 
     private fun startConfig(config: SshConfig) {
-        if (isConfigActive(config.id)) return
+        synchronized(activeJobs) {
+            if (isConfigActive(config.id) || activeJobs.containsKey(config.id)) return
 
-        if (wakeLock?.isHeld == false) {
-            try {
-                wakeLock?.acquire(config.timeoutWakeLock)
-            } catch (e: Exception) {
-            }
-        }
-
-        updateSummaryNotification()
-
-        val job = serviceScope.launch {
-            try {
-                establishTunnel(config)
-            } catch (e: CancellationException) {
-                // Shutdown
-            } catch (e: Exception) {
-                if (e !is HostKeyVerificationException) {
-                    val current = retryCounts[config.id] ?: 0
-                    retryCounts[config.id] = current + 1
+            if (wakeLock?.isHeld == false) {
+                try {
+                    wakeLock?.acquire(config.timeoutWakeLock)
+                } catch (e: Exception) {
                 }
-            } finally {
-                onConfigDisconnected(config.id)
             }
+
+            updateSummaryNotification()
+
+            val job = serviceScope.launch {
+                try {
+                    establishTunnel(config)
+                } catch (e: CancellationException) {
+                    // Shutdown
+                } catch (e: Exception) {
+                    if (e !is HostKeyVerificationException) {
+                        val current = retryCounts[config.id] ?: 0
+                        retryCounts[config.id] = current + 1
+                    }
+                } finally {
+                    onConfigDisconnected(config.id)
+                }
+            }
+            activeJobs[config.id] = job
         }
-        activeJobs[config.id] = job
     }
 
     private fun updateSummaryNotification() {

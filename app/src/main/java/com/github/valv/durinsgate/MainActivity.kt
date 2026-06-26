@@ -106,8 +106,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun restoreTunnels() {
-        val configs = storage.loadConfigs()
-        configs.filter { it.isEnabled }.forEach { startSshService(it) }
+        val intent = Intent(this, SshForegroundService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 
     private fun setupRecyclerView() {
@@ -145,7 +149,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startSshService(config: SshConfig) {
-        // Fix 7: Pass only the config ID
         val intent = Intent(this, SshForegroundService::class.java).apply {
             putExtra(SshForegroundService.EXTRA_CONFIG_ID, config.id)
         }
