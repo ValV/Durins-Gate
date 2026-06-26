@@ -36,6 +36,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.pow
 
 class SshForegroundService : Service() {
 
@@ -44,6 +45,7 @@ class SshForegroundService : Service() {
     private val activeClients = ConcurrentHashMap<String, SSHClient>()
     private val activeJobs = ConcurrentHashMap<String, Job>()
     private val activeProxies = ConcurrentHashMap<String, ServerSocket>()
+    private val retryCounts = ConcurrentHashMap<String, Int>()
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -124,7 +126,6 @@ class SshForegroundService : Service() {
             }
         }
 
-        // Fix 7: Use EXTRA_CONFIG_ID instead of serialized object
         val configId = intent.getStringExtra(EXTRA_CONFIG_ID)
         if (configId != null) {
             serviceScope.launch {
@@ -156,8 +157,6 @@ class SshForegroundService : Service() {
     private fun startConfig(config: SshConfig) {
         if (isConfigActive(config.id)) return
 
-        // Fix 1: Config ID is added only after successful authentication in establishTunnel
-
         if (wakeLock?.isHeld == false) {
             try {
                 wakeLock?.acquire(config.timeoutWakeLock)
@@ -173,7 +172,10 @@ class SshForegroundService : Service() {
             } catch (e: CancellationException) {
                 // Shutdown
             } catch (e: Exception) {
-                // Logged in establishTunnel
+                if (e !is HostKeyVerificationException) {
+                    val current = retryCounts[config.id] ?: 0
+                    retryCounts[config.id] = current + 1
+                }
             } finally {
                 onConfigDisconnected(config.id)
             }
@@ -234,11 +236,9 @@ class SshForegroundService : Service() {
             .build()
 
         val manager = getSystemService(NotificationManager::class.java)
-        // Unique ID per host to allow multiple simultaneous verifications
         manager.notify(config.host.hashCode(), notification)
     }
 
-    // Fix 5: Proxy error notification
     private fun showProxyErrorNotification(config: SshConfig, port: Int) {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Proxy Error")
@@ -255,6 +255,7 @@ class SshForegroundService : Service() {
         activeJobs[configId]?.cancel()
         activeClients[configId]?.disconnect()
         activeProxies[configId]?.close()
+        retryCounts.remove(configId)
         onConfigDisconnected(configId)
     }
 
@@ -267,6 +268,7 @@ class SshForegroundService : Service() {
         activeJobs.values.forEach { it.cancel() }
         activeClients.values.forEach { it.disconnect() }
         activeProxies.values.forEach { it.close() }
+        retryCounts.clear()
         synchronized(_activeConfigIds) { _activeConfigIds.clear() }
         stopServiceInternal()
     }
@@ -289,7 +291,6 @@ class SshForegroundService : Service() {
                 } else {
                     updateSummaryNotification()
                     if (config?.isEnabled == true) {
-                        // Fix 3 & 8: Verification timeout and stale check
                         val pending = HostKeyVerifierManager.pendingVerifications[config.host]
                         val isPending = pending != null
                         val isStale = isPending && (System.currentTimeMillis() - pending.second > config.verificationExpiry)
@@ -298,7 +299,20 @@ class SshForegroundService : Service() {
                             if (isStale) {
                                 HostKeyVerifierManager.pendingVerifications.remove(config.host)
                             }
-                            delay(config.timeoutVerificationRetry)
+
+                            val retryCount = retryCounts[configId] ?: 0
+                            val delayMs = if (retryCount > 0) {
+                                (config.timeoutVerificationRetry * config.backoffMultiplier.pow((retryCount - 1).toDouble()))
+                                    .toLong().coerceAtMost(config.maxRetryDelay)
+                            } else {
+                                config.timeoutVerificationRetry
+                            }
+
+                            if (retryCount > 0) {
+                                LogRepository.log("Gate [${config.name}]: Retrying in ${delayMs / 1000}s (Attempt $retryCount)")
+                            }
+
+                            delay(delayMs)
                             startConfig(config)
                         }
                     }
@@ -326,7 +340,6 @@ class SshForegroundService : Service() {
                 var cause: Throwable? = e
                 while (cause != null) {
                     if (cause is HostKeyVerificationException) {
-                        // Fix 3: Track timestamp
                         HostKeyVerifierManager.pendingVerifications[config.host] = Pair(cause, System.currentTimeMillis())
                         showVerificationNotification(config)
                         LogRepository.log("Gate [${config.name}]: Host verification required.")
@@ -350,7 +363,7 @@ class SshForegroundService : Service() {
 
             if (client.isAuthenticated) {
                 LogRepository.log("Gate Open: ${config.name}")
-                // Fix 1: Add to active set only after successful authentication
+                retryCounts[config.id] = 0
                 synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
                 updateSummaryNotification()
 
@@ -411,7 +424,6 @@ class SshForegroundService : Service() {
                         if (retries > 0) {
                             delay(config.socks5BindRetryDelay)
                         } else {
-                            // Fix 5: Explicit log and notification
                             LogRepository.log(
                                 "Gate [${config.name}]: SOCKS5 proxy failed to bind to port $port after ${config.socks5BindRetries} retries"
                             )
@@ -447,7 +459,6 @@ class SshForegroundService : Service() {
                     val input = s.getInputStream()
                     val output = s.getOutputStream()
 
-                    // Bounds check for initial greeting
                     val version = input.read()
                     if (version != 5) return@withContext
 
@@ -465,7 +476,6 @@ class SshForegroundService : Service() {
                     output.write(byteArrayOf(5, 0))
                     output.flush()
 
-                    // Request
                     val ver = input.read()
                     if (ver != 5) return@withContext
                     val cmd = input.read()
@@ -480,7 +490,6 @@ class SshForegroundService : Service() {
                         }
 
                         3 -> {
-                            // Fix 4: Size limits in SOCKS5
                             val len = input.read()
                             if (len <= 0 || len > 255) return@withContext
                             val addr = ByteArray(len)
@@ -514,7 +523,6 @@ class SshForegroundService : Service() {
                         }
                     }
                 } catch (e: Exception) {
-                    // Fix 6: Pipe error handling
                     Log.w(TAG, "SOCKS5 request error: ${e.message}")
                 }
             }
@@ -540,7 +548,6 @@ class SshForegroundService : Service() {
                 }
             }
         } catch (e: Exception) {
-            // Fix 6: Pipe error handling
             Log.w(TAG, "Pipe error during SOCKS5 forwarding: ${e.message}")
         }
     }

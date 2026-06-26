@@ -18,8 +18,9 @@ data class SshConfig(
     var timeoutClient: Int = 15000,
     var connectionCheckInterval: Long = 2000,
     var timeoutWakeLock: Long = 3600 * 1000L,
-    // Fix 8: Timeout for pending verifications
     var verificationExpiry: Long = 5 * 60 * 1000L, // 5 minutes
     var timeoutVerificationRetry: Long = 5000,
+    var backoffMultiplier: Double = 2.0,
+    var maxRetryDelay: Long = 10 * 60 * 1000L,
     var isEnabled: Boolean = false
 ) : Serializable
