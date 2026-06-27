@@ -124,7 +124,7 @@ class SshForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        updateSummaryNotification()
+        //updateSummaryNotification()
 
         if (intent == null) {
             restoreTunnelsFromStorage()
@@ -227,37 +227,58 @@ class SshForegroundService : Service() {
             }
             activeJobs[config.id] = job
 
-            // 5. Update notification ONCE after the job is registered
-            updateSummaryNotification()
         }
+        // 5. Update notification ONCE after the job is registered
+        updateSummaryNotification()
     }
 
     private fun updateSummaryNotification() {
-        serviceScope.launch {
-            val storage = ConfigStorage(this@SshForegroundService)
-            val enabledConfigs = storage.loadConfigs().filter { it.isEnabled }
-            val activeCount = activeConfigIds.size
-            val enabledCount = enabledConfigs.size
+//        serviceScope.launch {
+//            val storage = ConfigStorage(this@SshForegroundService)
+//            val enabledConfigs = storage.loadConfigs().filter { it.isEnabled }
+//            val activeCount = activeConfigIds.size
+//            val enabledCount = enabledConfigs.size
+//
+//            withContext(Dispatchers.Main) {
+//                val statusText = when {
+//                    activeCount > 0 && activeCount < enabledCount -> "Connecting: $activeCount/$enabledCount"
+//                    activeCount > 0 -> "Active Gates: $activeCount"
+//                    enabledCount > 0 -> "Waiting for network..."
+//                    else -> "Durin's Gate Service Active"
+//                }
+//
+//                val notification = createNotification(statusText)
+//                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+//                    startForeground(
+//                        NOTIFICATION_ID,
+//                        notification,
+//                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+//                    )
+//                } else {
+//                    startForeground(NOTIFICATION_ID, notification)
+//                }
+//            }
+//        }
+        // 1. Get the current active count from our memory set
+        val activeCount = synchronized(_activeConfigIds) { _activeConfigIds.size }
 
-            withContext(Dispatchers.Main) {
-                val statusText = when {
-                    activeCount > 0 && activeCount < enabledCount -> "Connecting: $activeCount/$enabledCount"
-                    activeCount > 0 -> "Active Gates: $activeCount"
-                    enabledCount > 0 -> "Waiting for network..."
-                    else -> "Durin's Gate Service Active"
-                }
+        // 2. Note: We don't really need the 'total enabled' from disk every time.
+        // Track the total enabled count in a private variable for the "X/Y" text
+        // when restoreTunnelsFromStorage is called, or simplify the UI
 
-                val notification = createNotification(statusText)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    startForeground(
-                        NOTIFICATION_ID,
-                        notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                    )
-                } else {
-                    startForeground(NOTIFICATION_ID, notification)
-                }
-            }
+        val statusText = when {
+            activeCount > 0 -> "Active Gates: $activeCount"
+            else -> "Durin's Gate Service Active"
+        }
+
+        val notification = createNotification(statusText)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID, notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
         }
     }
 
@@ -332,11 +353,17 @@ class SshForegroundService : Service() {
     }
 
     private fun onConfigDisconnected(configId: String) {
-        activeJobs.remove(configId)
-        activeClients.remove(configId)
-        activeProxies.remove(configId)
-        synchronized(_activeConfigIds) { _activeConfigIds.remove(configId) }
+        synchronized(activeJobs) {
+            activeJobs.remove(configId)
+            activeClients.remove(configId)
+            activeProxies.remove(configId)
+            synchronized(_activeConfigIds) { _activeConfigIds.remove(configId) }
+        }
 
+        // Synchronous update
+        updateSummaryNotification()
+
+        // Handle auto-stop if no gates are left (This can stay in a coroutine as it happens once)
         serviceScope.launch {
             val storage = ConfigStorage(this@SshForegroundService)
             val configs = storage.loadConfigs()
@@ -347,15 +374,16 @@ class SshForegroundService : Service() {
                 if (activeConfigIds.isEmpty() && !anyEnabled) {
                     stopServiceInternal()
                 } else {
-                    updateSummaryNotification()
+                    //updateSummaryNotification()
                     if (config?.isEnabled == true && currentNetwork != null) {
+                        val lookupKey = HostKeyVerifierManager.getLookupKey(config.host, config.port)
                         val pending = HostKeyVerifierManager.pendingVerifications[config.host]
                         val isPending = pending != null
                         val isStale = isPending && (System.currentTimeMillis() - pending.second > config.verificationExpiry)
 
                         if (!isPending || isStale) {
                             if (isStale) {
-                                HostKeyVerifierManager.pendingVerifications.remove(config.host)
+                                HostKeyVerifierManager.pendingVerifications.remove(lookupKey)
                             }
 
                             val retryCount = retryCounts[configId] ?: 0
@@ -371,7 +399,11 @@ class SshForegroundService : Service() {
                             }
 
                             delay(delayMs)
-                            startConfig(config)
+                            // Re-verify network hasn't dropped during delay
+                            if (isActive && currentNetwork != null) {
+                                startConfig(config)
+                            }
+                            //startConfig(config)
                         }
                     }
                 }
