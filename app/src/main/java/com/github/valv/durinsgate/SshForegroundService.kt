@@ -185,30 +185,50 @@ class SshForegroundService : Service() {
 
     private fun startConfig(config: SshConfig) {
         synchronized(activeJobs) {
+            // Prevent duplicate jobs for the same config
             if (activeJobs.containsKey(config.id)) return
 
+            // 1. Acquire WakeLock outside the coroutine to ensure it's held immediately
             if (wakeLock?.isHeld == false) {
                 try {
                     wakeLock?.acquire(config.timeoutWakeLock)
                 } catch (e: Exception) {
+                    Log.e(TAG, "Failed to acquire wake lock", e)
                 }
             }
 
+            // 2. Add to active set IMMEDIATELY before launching.
+            // This ensures isConfigActive() is true for the UI Adapter right away
+            synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
+
+            // 3. Launch the worker
             val job = serviceScope.launch {
                 try {
+                    // Add to active set only once the attempt actually starts
                     establishTunnel(config)
                 } catch (e: CancellationException) {
                     // Shutdown
                 } catch (e: Exception) {
+                    Log.e(TAG, "Tunnel execution failed for ${config.name}", e)
                     if (e !is HostKeyVerificationException) {
                         val current = retryCounts[config.id] ?: 0
                         retryCounts[config.id] = current + 1
                     }
+                    // If it's a verification exception, we might want to notify UI
+                    if (e is HostKeyVerificationException) {
+                        withContext(Dispatchers.Main) {
+                            showVerificationNotification(config)
+                        }
+                    }
                 } finally {
+                    // 4. This is the only place we remove and refresh
                     onConfigDisconnected(config.id)
                 }
             }
             activeJobs[config.id] = job
+
+            // 5. Update notification ONCE after the job is registered
+            updateSummaryNotification()
         }
     }
 
@@ -246,6 +266,7 @@ class SshForegroundService : Service() {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(EXTRA_CONFIG_ID, config.id)
             putExtra("hostname", config.host)
+            putExtra("key", HostKeyVerifierManager.getLookupKey(config.host, config.port))
         }
         val pendingIntent = PendingIntent.getActivity(
             this,
@@ -377,7 +398,8 @@ class SshForegroundService : Service() {
                 var cause: Throwable? = e
                 while (cause != null) {
                     if (cause is HostKeyVerificationException) {
-                        HostKeyVerifierManager.pendingVerifications[config.host] = Pair(cause, System.currentTimeMillis())
+                        val lookupKey = HostKeyVerifierManager.getLookupKey(cause.hostname, cause.port)
+                        HostKeyVerifierManager.pendingVerifications[lookupKey] = Pair(cause, System.currentTimeMillis())
                         showVerificationNotification(config)
                         LogRepository.log("Gate [${config.name}]: Host verification required.")
                         throw cause
@@ -401,8 +423,8 @@ class SshForegroundService : Service() {
             if (client.isAuthenticated) {
                 LogRepository.log("Gate Open: ${config.name}")
                 retryCounts[config.id] = 0
-                synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
-                updateSummaryNotification()
+                //synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
+                //updateSummaryNotification()
 
                 coroutineScope {
                     var proxyJob: Job? = null

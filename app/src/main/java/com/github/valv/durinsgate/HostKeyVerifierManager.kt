@@ -129,8 +129,9 @@ class HostKeyVerifierManager(private val context: Context) {
     }
 
     companion object {
-        // Fix 3 & 8: Tracking timestamp for pending verifications
         val pendingVerifications = ConcurrentHashMap<String, Pair<HostKeyVerificationException, Long>>()
+
+        fun getLookupKey(hostname: String, port: Int): String = "[$hostname]:$port"
 
         fun getFingerprint(key: PublicKey): String {
             return net.schmizz.sshj.common.SecurityUtils.getFingerprint(key)
