@@ -28,6 +28,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
 import java.io.InputStream
@@ -36,6 +37,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.pow
 
 class SshForegroundService : Service() {
 
@@ -44,8 +46,10 @@ class SshForegroundService : Service() {
     private val activeClients = ConcurrentHashMap<String, SSHClient>()
     private val activeJobs = ConcurrentHashMap<String, Job>()
     private val activeProxies = ConcurrentHashMap<String, ServerSocket>()
+    private val retryCounts = ConcurrentHashMap<String, Int>()
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var currentNetwork: Network? = null
 
     companion object {
         const val TAG = "SshService"
@@ -82,8 +86,35 @@ class SshForegroundService : Service() {
             getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.d(TAG, "Network restored. Attempting to reconnect gates...")
-                restoreTunnelsFromStorage()
+                if (currentNetwork == network) return
+
+                Log.d(TAG, "Network changed/restored. Refreshing tunnels...")
+                currentNetwork = network
+
+                // If network actually changed, we must drop existing dangling connections
+                // because their TCP sockets are bound to the old network interface.
+                serviceScope.launch {
+                    val storage = ConfigStorage(this@SshForegroundService)
+                    val enabledConfigs = storage.loadConfigs().filter { it.isEnabled }
+
+                    withContext(Dispatchers.Main) {
+                        enabledConfigs.forEach { config ->
+                            // Force restart if it's already "active" on a dead network
+                            if (activeJobs.containsKey(config.id)) {
+                                stopConfigInternal(config.id)
+                            }
+                            startConfig(config)
+                        }
+                        updateSummaryNotification()
+                    }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                if (currentNetwork == network) {
+                    currentNetwork = null
+                    Log.d(TAG, "Primary network lost.")
+                }
             }
         }
         val request = NetworkRequest.Builder()
@@ -124,15 +155,12 @@ class SshForegroundService : Service() {
             }
         }
 
-        val config = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent.getSerializableExtra("config", SshConfig::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getSerializableExtra("config") as? SshConfig
-        }
-
-        if (config != null) {
-            startConfig(config)
+        val configId = intent.getStringExtra(EXTRA_CONFIG_ID)
+        if (configId != null) {
+            serviceScope.launch {
+                val storage = ConfigStorage(this@SshForegroundService)
+                storage.loadConfigs().find { it.id == configId }?.let { startConfig(it) }
+            }
         } else {
             restoreTunnelsFromStorage()
         }
@@ -156,31 +184,32 @@ class SshForegroundService : Service() {
     }
 
     private fun startConfig(config: SshConfig) {
-        if (isConfigActive(config.id)) return
+        synchronized(activeJobs) {
+            if (activeJobs.containsKey(config.id)) return
 
-        synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
-
-        if (wakeLock?.isHeld == false) {
-            try {
-                wakeLock?.acquire(3600 * 1000L)
-            } catch (e: Exception) {
+            if (wakeLock?.isHeld == false) {
+                try {
+                    wakeLock?.acquire(config.timeoutWakeLock)
+                } catch (e: Exception) {
+                }
             }
-        }
 
-        updateSummaryNotification()
-
-        val job = serviceScope.launch {
-            try {
-                establishTunnel(config)
-            } catch (e: CancellationException) {
-                // Shutdown
-            } catch (e: Exception) {
-                // Logged in establishTunnel
-            } finally {
-                onConfigDisconnected(config.id)
+            val job = serviceScope.launch {
+                try {
+                    establishTunnel(config)
+                } catch (e: CancellationException) {
+                    // Shutdown
+                } catch (e: Exception) {
+                    if (e !is HostKeyVerificationException) {
+                        val current = retryCounts[config.id] ?: 0
+                        retryCounts[config.id] = current + 1
+                    }
+                } finally {
+                    onConfigDisconnected(config.id)
+                }
             }
+            activeJobs[config.id] = job
         }
-        activeJobs[config.id] = job
     }
 
     private fun updateSummaryNotification() {
@@ -236,15 +265,37 @@ class SshForegroundService : Service() {
             .build()
 
         val manager = getSystemService(NotificationManager::class.java)
-        // Unique ID per host to allow multiple simultaneous verifications
         manager.notify(config.host.hashCode(), notification)
     }
 
+    private fun showProxyErrorNotification(config: SshConfig, port: Int) {
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Proxy Error")
+            .setContentText("Gate [${config.name}]: SOCKS5 proxy failed to bind to port $port.")
+            .setSmallIcon(R.drawable.ic_notification_gate)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(config.id.hashCode() + 1000, notification)
+    }
+
     private fun stopConfig(configId: String) {
-        activeJobs[configId]?.cancel()
-        activeClients[configId]?.disconnect()
-        activeProxies[configId]?.close()
+        stopConfigInternal(configId)
+        retryCounts.remove(configId)
         onConfigDisconnected(configId)
+    }
+
+    private fun stopConfigInternal(configId: String) {
+        activeJobs.remove(configId)?.cancel()
+        activeClients.remove(configId)?.let { client ->
+            serviceScope.launch {
+                try { client.disconnect() } catch (e: Exception) {}
+            }
+        }
+        activeProxies.remove(configId)?.let { proxy ->
+            try { proxy.close() } catch (e: Exception) {}
+        }
     }
 
     private fun stopAll() {
@@ -253,9 +304,8 @@ class SshForegroundService : Service() {
         configs.forEach { it.isEnabled = false }
         storage.saveConfigs(configs)
 
-        activeJobs.values.forEach { it.cancel() }
-        activeClients.values.forEach { it.disconnect() }
-        activeProxies.values.forEach { it.close() }
+        activeJobs.keys.toList().forEach { stopConfigInternal(it) }
+        retryCounts.clear()
         synchronized(_activeConfigIds) { _activeConfigIds.clear() }
         stopServiceInternal()
     }
@@ -277,11 +327,29 @@ class SshForegroundService : Service() {
                     stopServiceInternal()
                 } else {
                     updateSummaryNotification()
-                    if (config?.isEnabled == true) {
-                        val isPending =
-                            HostKeyVerifierManager.pendingVerifications.containsKey(config.host)
-                        if (!isPending) {
-                            delay(5000)
+                    if (config?.isEnabled == true && currentNetwork != null) {
+                        val pending = HostKeyVerifierManager.pendingVerifications[config.host]
+                        val isPending = pending != null
+                        val isStale = isPending && (System.currentTimeMillis() - pending.second > config.verificationExpiry)
+
+                        if (!isPending || isStale) {
+                            if (isStale) {
+                                HostKeyVerifierManager.pendingVerifications.remove(config.host)
+                            }
+
+                            val retryCount = retryCounts[configId] ?: 0
+                            val delayMs = if (retryCount > 0) {
+                                (config.timeoutVerificationRetry * config.backoffMultiplier.pow((retryCount - 1).toDouble()))
+                                    .toLong().coerceAtMost(config.maxRetryDelay)
+                            } else {
+                                config.timeoutVerificationRetry
+                            }
+
+                            if (retryCount > 0) {
+                                LogRepository.log("Gate [${config.name}]: Retrying in ${delayMs / 1000}s (Attempt $retryCount)")
+                            }
+
+                            delay(delayMs)
                             startConfig(config)
                         }
                     }
@@ -298,8 +366,8 @@ class SshForegroundService : Service() {
             val verifierManager = HostKeyVerifierManager(this@SshForegroundService)
             client.addHostKeyVerifier(verifierManager.getVerifier())
 
-            client.connectTimeout = 10000
-            client.timeout = 15000
+            client.connectTimeout = config.timeoutConnect
+            client.timeout = config.timeoutClient
 
             LogRepository.log("Gate [${config.name}]: Connecting...")
 
@@ -309,7 +377,7 @@ class SshForegroundService : Service() {
                 var cause: Throwable? = e
                 while (cause != null) {
                     if (cause is HostKeyVerificationException) {
-                        HostKeyVerifierManager.pendingVerifications[config.host] = cause
+                        HostKeyVerifierManager.pendingVerifications[config.host] = Pair(cause, System.currentTimeMillis())
                         showVerificationNotification(config)
                         LogRepository.log("Gate [${config.name}]: Host verification required.")
                         throw cause
@@ -332,18 +400,29 @@ class SshForegroundService : Service() {
 
             if (client.isAuthenticated) {
                 LogRepository.log("Gate Open: ${config.name}")
+                retryCounts[config.id] = 0
+                synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
                 updateSummaryNotification()
 
                 coroutineScope {
                     var proxyJob: Job? = null
                     if (config.isSocks5) {
-                        proxyJob = launch { runSocks5Server(config.id, client, config.localPort) }
+                        proxyJob = launch { runSocks5Server(config, client, config.localPort) }
                     }
 
                     try {
                         while (isActive && client.isConnected) {
-                            delay(2000)
+                            // SURGICAL FIX: Send a global request "keepalive@openssh.com"
+                            // to verify the server is still actually responding
+                            client.connection.sendGlobalRequest(
+                                "keepalive@openssh.com",
+                                true,
+                                ByteArray(0)
+                            )
+                            delay(config.connectionCheckInterval)
                         }
+                    } catch (e: Exception) {
+                        LogRepository.log("Gate [${config.name}]: Connection lost (Ping failed)")
                     } finally {
                         proxyJob?.cancelAndJoin()
                         activeProxies[config.id]?.close()
@@ -371,17 +450,17 @@ class SshForegroundService : Service() {
         }
     }
 
-    private suspend fun runSocks5Server(configId: String, ssh: SSHClient, port: Int) =
+    private suspend fun runSocks5Server(config: SshConfig, ssh: SSHClient, port: Int) =
         withContext(Dispatchers.IO) {
             var serverSocket: ServerSocket? = null
             try {
-                var retries = 5
+                var retries = config.socks5BindRetries
                 while (retries > 0 && isActive) {
                     try {
                         serverSocket = ServerSocket()
                         serverSocket.reuseAddress = true
                         serverSocket.bind(InetSocketAddress("127.0.0.1", port))
-                        activeProxies[configId] = serverSocket
+                        activeProxies[config.id] = serverSocket
                         Log.d(TAG, "SOCKS5 Proxy ready on port $port")
                         break
                     } catch (e: java.net.BindException) {
@@ -389,9 +468,12 @@ class SshForegroundService : Service() {
                         serverSocket = null
                         retries--
                         if (retries > 0) {
-                            delay(1000)
+                            delay(config.socks5BindRetryDelay)
                         } else {
-                            LogRepository.log("Proxy Error: Port $port is in use.")
+                            LogRepository.log(
+                                "Gate [${config.name}]: SOCKS5 proxy failed to bind to port $port after ${config.socks5BindRetries} retries"
+                            )
+                            // showProxyErrorNotification(config, port) // spamming with system notifications
                             return@withContext
                         }
                     }
@@ -399,7 +481,7 @@ class SshForegroundService : Service() {
 
                 while (isActive && serverSocket?.isClosed == false) {
                     val clientSocket = try {
-                        serverSocket?.accept()
+                        serverSocket.accept()
                     } catch (e: Exception) {
                         null
                     }
@@ -408,7 +490,7 @@ class SshForegroundService : Service() {
                     }
                 }
             } finally {
-                activeProxies.remove(configId)
+                activeProxies.remove(config.id)
                 try {
                     serverSocket?.close()
                 } catch (e: Exception) {
@@ -423,50 +505,49 @@ class SshForegroundService : Service() {
                     val input = s.getInputStream()
                     val output = s.getOutputStream()
 
-                    // Bounds check for initial greeting
                     val version = input.read()
+                    if (version == -1) return@withContext // connection closed immediately
                     if (version != 5) return@withContext
 
                     val nMethods = input.read()
                     if (nMethods <= 0) return@withContext
 
                     val methods = ByteArray(nMethods)
-                    var methodsRead = 0
-                    while (methodsRead < nMethods) {
-                        val read = input.read(methods, methodsRead, nMethods - methodsRead)
-                        if (read == -1) return@withContext
-                        methodsRead += read
+                    // Use existing readFully helper to ensure we get all method bytes
+                    try {
+                        input.readFully(methods)
+                    } catch (e: Exception) {
+                        return@withContext
                     }
 
                     output.write(byteArrayOf(5, 0))
                     output.flush()
 
-                    // Request
                     val ver = input.read()
                     if (ver != 5) return@withContext
                     val cmd = input.read()
                     input.read() // RSV
-                    val atyp = input.read()
+                    val aType = input.read()
 
-                    val targetHost = when (atyp) {
+                    val targetHost = when (aType) {
                         1 -> {
-                            val addr = ByteArray(4)
-                            input.readFully(addr)
-                            java.net.InetAddress.getByAddress(addr).hostAddress
+                            val address = ByteArray(4)
+                            input.readFully(address)
+                            java.net.InetAddress.getByAddress(address).hostAddress
                         }
 
                         3 -> {
                             val len = input.read()
-                            if (len <= 0) return@withContext
-                            val addr = ByteArray(len)
-                            input.readFully(addr)
-                            String(addr)
+                            if (len <= 0 || len > 255) return@withContext
+                            val address = ByteArray(len)
+                            input.readFully(address)
+                            String(address)
                         }
 
                         4 -> { // IPv6
-                            val addr = ByteArray(16)
-                            input.readFully(addr)
-                            java.net.InetAddress.getByAddress(addr).hostAddress
+                            val address = ByteArray(16)
+                            input.readFully(address)
+                            java.net.InetAddress.getByAddress(address).hostAddress?.split("%")[0]
                         }
 
                         else -> return@withContext
@@ -483,12 +564,23 @@ class SshForegroundService : Service() {
                         output.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
                         output.flush()
 
-                        coroutineScope {
-                            launch { pipe(input, channel.outputStream) }
-                            launch { pipe(channel.inputStream, output) }
+                        try{ coroutineScope {
+                            val jobIn = launch { pipe(this, input, channel.outputStream) }
+                            val jobOut = launch { pipe(this, channel.inputStream, output) }
+
+                            // Wait for the FIRST one to finish, then cancel the other
+                            // This is the "Race" pattern
+                            select<Unit> {
+                                jobIn.onJoin { jobOut.cancel() }
+                                jobOut.onJoin { jobIn.cancel() }
+                            }
+                        }
+                        } catch (e: CancellationException) {
+                            // Normal behavior when we cancel the second job
                         }
                     }
                 } catch (e: Exception) {
+                    Log.w(TAG, "SOCKS5 request error: ${e.message}")
                 }
             }
         }
@@ -502,17 +594,27 @@ class SshForegroundService : Service() {
         }
     }
 
-    private fun pipe(from: InputStream, to: OutputStream) {
+    private fun pipe(scope: CoroutineScope, from: InputStream, to: OutputStream) {
         val buffer = ByteArray(16384)
         try {
             var read: Int
-            while (from.read(buffer).also { read = it } != -1) {
+            while (scope.isActive) {
+                read = from.read(buffer)
+                if (read == -1) break
                 if (read > 0) {
                     to.write(buffer, 0, read)
                     to.flush()
                 }
             }
         } catch (e: Exception) {
+            // Log only if it's not a normal closure
+            if (e !is java.net.SocketException) {
+                Log.w(TAG, "Pipe error: ${e.message}")
+            }
+        } finally {
+            // This is correct: closing the stream unblocks the other thread's read()
+            try { to.close() } catch (_: Exception) {}
+            try { from.close() } catch (_: Exception) {}
         }
     }
 
