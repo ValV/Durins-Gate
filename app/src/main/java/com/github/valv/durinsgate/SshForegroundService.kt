@@ -124,7 +124,7 @@ class SshForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        updateSummaryNotification()
+        //updateSummaryNotification()
 
         if (intent == null) {
             restoreTunnelsFromStorage()
@@ -185,59 +185,100 @@ class SshForegroundService : Service() {
 
     private fun startConfig(config: SshConfig) {
         synchronized(activeJobs) {
+            // Prevent duplicate jobs for the same config
             if (activeJobs.containsKey(config.id)) return
 
+            // 1. Acquire WakeLock outside the coroutine to ensure it's held immediately
             if (wakeLock?.isHeld == false) {
                 try {
                     wakeLock?.acquire(config.timeoutWakeLock)
                 } catch (e: Exception) {
+                    Log.e(TAG, "Failed to acquire wake lock", e)
                 }
             }
 
+            // 2. Add to active set IMMEDIATELY before launching.
+            // This ensures isConfigActive() is true for the UI Adapter right away
+            synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
+
+            // 3. Launch the worker
             val job = serviceScope.launch {
                 try {
+                    // Add to active set only once the attempt actually starts
                     establishTunnel(config)
                 } catch (e: CancellationException) {
                     // Shutdown
                 } catch (e: Exception) {
+                    Log.e(TAG, "Tunnel execution failed for ${config.name}", e)
                     if (e !is HostKeyVerificationException) {
                         val current = retryCounts[config.id] ?: 0
                         retryCounts[config.id] = current + 1
                     }
+                    // If it's a verification exception, we might want to notify UI
+                    if (e is HostKeyVerificationException) {
+                        withContext(Dispatchers.Main) {
+                            showVerificationNotification(config)
+                        }
+                    }
                 } finally {
+                    // 4. This is the only place we remove and refresh
                     onConfigDisconnected(config.id)
                 }
             }
             activeJobs[config.id] = job
+
         }
+        // 5. Update notification ONCE after the job is registered
+        updateSummaryNotification()
     }
 
     private fun updateSummaryNotification() {
-        serviceScope.launch {
-            val storage = ConfigStorage(this@SshForegroundService)
-            val enabledConfigs = storage.loadConfigs().filter { it.isEnabled }
-            val activeCount = activeConfigIds.size
-            val enabledCount = enabledConfigs.size
+//        serviceScope.launch {
+//            val storage = ConfigStorage(this@SshForegroundService)
+//            val enabledConfigs = storage.loadConfigs().filter { it.isEnabled }
+//            val activeCount = activeConfigIds.size
+//            val enabledCount = enabledConfigs.size
+//
+//            withContext(Dispatchers.Main) {
+//                val statusText = when {
+//                    activeCount > 0 && activeCount < enabledCount -> "Connecting: $activeCount/$enabledCount"
+//                    activeCount > 0 -> "Active Gates: $activeCount"
+//                    enabledCount > 0 -> "Waiting for network..."
+//                    else -> "Durin's Gate Service Active"
+//                }
+//
+//                val notification = createNotification(statusText)
+//                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+//                    startForeground(
+//                        NOTIFICATION_ID,
+//                        notification,
+//                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+//                    )
+//                } else {
+//                    startForeground(NOTIFICATION_ID, notification)
+//                }
+//            }
+//        }
+        // 1. Get the current active count from our memory set
+        val activeCount = synchronized(_activeConfigIds) { _activeConfigIds.size }
 
-            withContext(Dispatchers.Main) {
-                val statusText = when {
-                    activeCount > 0 && activeCount < enabledCount -> "Connecting: $activeCount/$enabledCount"
-                    activeCount > 0 -> "Active Gates: $activeCount"
-                    enabledCount > 0 -> "Waiting for network..."
-                    else -> "Durin's Gate Service Active"
-                }
+        // 2. Note: We don't really need the 'total enabled' from disk every time.
+        // Track the total enabled count in a private variable for the "X/Y" text
+        // when restoreTunnelsFromStorage is called, or simplify the UI
 
-                val notification = createNotification(statusText)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    startForeground(
-                        NOTIFICATION_ID,
-                        notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                    )
-                } else {
-                    startForeground(NOTIFICATION_ID, notification)
-                }
-            }
+        val statusText = when {
+            activeCount > 0 -> "Active Gates: $activeCount"
+            else -> "Durin's Gate Service Active"
+        }
+
+        val notification = createNotification(statusText)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID, notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
         }
     }
 
@@ -246,6 +287,7 @@ class SshForegroundService : Service() {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(EXTRA_CONFIG_ID, config.id)
             putExtra("hostname", config.host)
+            putExtra("key", HostKeyVerifierManager.getLookupKey(config.host, config.port))
         }
         val pendingIntent = PendingIntent.getActivity(
             this,
@@ -311,11 +353,17 @@ class SshForegroundService : Service() {
     }
 
     private fun onConfigDisconnected(configId: String) {
-        activeJobs.remove(configId)
-        activeClients.remove(configId)
-        activeProxies.remove(configId)
-        synchronized(_activeConfigIds) { _activeConfigIds.remove(configId) }
+        synchronized(activeJobs) {
+            activeJobs.remove(configId)
+            activeClients.remove(configId)
+            activeProxies.remove(configId)
+            synchronized(_activeConfigIds) { _activeConfigIds.remove(configId) }
+        }
 
+        // Synchronous update
+        updateSummaryNotification()
+
+        // Handle auto-stop if no gates are left (This can stay in a coroutine as it happens once)
         serviceScope.launch {
             val storage = ConfigStorage(this@SshForegroundService)
             val configs = storage.loadConfigs()
@@ -326,15 +374,16 @@ class SshForegroundService : Service() {
                 if (activeConfigIds.isEmpty() && !anyEnabled) {
                     stopServiceInternal()
                 } else {
-                    updateSummaryNotification()
+                    //updateSummaryNotification()
                     if (config?.isEnabled == true && currentNetwork != null) {
+                        val lookupKey = HostKeyVerifierManager.getLookupKey(config.host, config.port)
                         val pending = HostKeyVerifierManager.pendingVerifications[config.host]
                         val isPending = pending != null
                         val isStale = isPending && (System.currentTimeMillis() - pending.second > config.verificationExpiry)
 
                         if (!isPending || isStale) {
                             if (isStale) {
-                                HostKeyVerifierManager.pendingVerifications.remove(config.host)
+                                HostKeyVerifierManager.pendingVerifications.remove(lookupKey)
                             }
 
                             val retryCount = retryCounts[configId] ?: 0
@@ -350,7 +399,11 @@ class SshForegroundService : Service() {
                             }
 
                             delay(delayMs)
-                            startConfig(config)
+                            // Re-verify network hasn't dropped during delay
+                            if (isActive && currentNetwork != null) {
+                                startConfig(config)
+                            }
+                            //startConfig(config)
                         }
                     }
                 }
@@ -377,7 +430,8 @@ class SshForegroundService : Service() {
                 var cause: Throwable? = e
                 while (cause != null) {
                     if (cause is HostKeyVerificationException) {
-                        HostKeyVerifierManager.pendingVerifications[config.host] = Pair(cause, System.currentTimeMillis())
+                        val lookupKey = HostKeyVerifierManager.getLookupKey(cause.hostname, cause.port)
+                        HostKeyVerifierManager.pendingVerifications[lookupKey] = Pair(cause, System.currentTimeMillis())
                         showVerificationNotification(config)
                         LogRepository.log("Gate [${config.name}]: Host verification required.")
                         throw cause
@@ -401,8 +455,8 @@ class SshForegroundService : Service() {
             if (client.isAuthenticated) {
                 LogRepository.log("Gate Open: ${config.name}")
                 retryCounts[config.id] = 0
-                synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
-                updateSummaryNotification()
+                //synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
+                //updateSummaryNotification()
 
                 coroutineScope {
                     var proxyJob: Job? = null
