@@ -16,7 +16,7 @@ data class SshConfig(
     var socks5BindRetryDelay: Long = 1000,
     var timeoutConnect: Int = 10000,
     var timeoutClient: Int = 15000,
-    var connectionCheckInterval: Long = 2000,
+    var connectionCheckInterval: Long = 30000, // this was 2000, reduce if changes are too slow
     var timeoutWakeLock: Long = 3600 * 1000L,
     var verificationExpiry: Long = 5 * 60 * 1000L, // 5 minutes
     var timeoutVerificationRetry: Long = 5000,

@@ -28,6 +28,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
 import java.io.InputStream
@@ -48,6 +49,7 @@ class SshForegroundService : Service() {
     private val retryCounts = ConcurrentHashMap<String, Int>()
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var currentNetwork: Network? = null
 
     companion object {
         const val TAG = "SshService"
@@ -84,8 +86,35 @@ class SshForegroundService : Service() {
             getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.d(TAG, "Network restored. Attempting to reconnect gates...")
-                restoreTunnelsFromStorage()
+                if (currentNetwork == network) return
+
+                Log.d(TAG, "Network changed/restored. Refreshing tunnels...")
+                currentNetwork = network
+
+                // If network actually changed, we must drop existing dangling connections
+                // because their TCP sockets are bound to the old network interface.
+                serviceScope.launch {
+                    val storage = ConfigStorage(this@SshForegroundService)
+                    val enabledConfigs = storage.loadConfigs().filter { it.isEnabled }
+
+                    withContext(Dispatchers.Main) {
+                        enabledConfigs.forEach { config ->
+                            // Force restart if it's already "active" on a dead network
+                            if (activeJobs.containsKey(config.id)) {
+                                stopConfigInternal(config.id)
+                            }
+                            startConfig(config)
+                        }
+                        updateSummaryNotification()
+                    }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                if (currentNetwork == network) {
+                    currentNetwork = null
+                    Log.d(TAG, "Primary network lost.")
+                }
             }
         }
         val request = NetworkRequest.Builder()
@@ -156,7 +185,7 @@ class SshForegroundService : Service() {
 
     private fun startConfig(config: SshConfig) {
         synchronized(activeJobs) {
-            if (isConfigActive(config.id) || activeJobs.containsKey(config.id)) return
+            if (activeJobs.containsKey(config.id)) return
 
             if (wakeLock?.isHeld == false) {
                 try {
@@ -164,8 +193,6 @@ class SshForegroundService : Service() {
                 } catch (e: Exception) {
                 }
             }
-
-            updateSummaryNotification()
 
             val job = serviceScope.launch {
                 try {
@@ -254,11 +281,21 @@ class SshForegroundService : Service() {
     }
 
     private fun stopConfig(configId: String) {
-        activeJobs[configId]?.cancel()
-        activeClients[configId]?.disconnect()
-        activeProxies[configId]?.close()
+        stopConfigInternal(configId)
         retryCounts.remove(configId)
         onConfigDisconnected(configId)
+    }
+
+    private fun stopConfigInternal(configId: String) {
+        activeJobs.remove(configId)?.cancel()
+        activeClients.remove(configId)?.let { client ->
+            serviceScope.launch {
+                try { client.disconnect() } catch (e: Exception) {}
+            }
+        }
+        activeProxies.remove(configId)?.let { proxy ->
+            try { proxy.close() } catch (e: Exception) {}
+        }
     }
 
     private fun stopAll() {
@@ -267,9 +304,7 @@ class SshForegroundService : Service() {
         configs.forEach { it.isEnabled = false }
         storage.saveConfigs(configs)
 
-        activeJobs.values.forEach { it.cancel() }
-        activeClients.values.forEach { it.disconnect() }
-        activeProxies.values.forEach { it.close() }
+        activeJobs.keys.toList().forEach { stopConfigInternal(it) }
         retryCounts.clear()
         synchronized(_activeConfigIds) { _activeConfigIds.clear() }
         stopServiceInternal()
@@ -292,7 +327,7 @@ class SshForegroundService : Service() {
                     stopServiceInternal()
                 } else {
                     updateSummaryNotification()
-                    if (config?.isEnabled == true) {
+                    if (config?.isEnabled == true && currentNetwork != null) {
                         val pending = HostKeyVerifierManager.pendingVerifications[config.host]
                         val isPending = pending != null
                         val isStale = isPending && (System.currentTimeMillis() - pending.second > config.verificationExpiry)
@@ -377,8 +412,17 @@ class SshForegroundService : Service() {
 
                     try {
                         while (isActive && client.isConnected) {
+                            // SURGICAL FIX: Send a global request "keepalive@openssh.com"
+                            // to verify the server is still actually responding
+                            client.connection.sendGlobalRequest(
+                                "keepalive@openssh.com",
+                                true,
+                                ByteArray(0)
+                            )
                             delay(config.connectionCheckInterval)
                         }
+                    } catch (e: Exception) {
+                        LogRepository.log("Gate [${config.name}]: Connection lost (Ping failed)")
                     } finally {
                         proxyJob?.cancelAndJoin()
                         activeProxies[config.id]?.close()
@@ -429,7 +473,7 @@ class SshForegroundService : Service() {
                             LogRepository.log(
                                 "Gate [${config.name}]: SOCKS5 proxy failed to bind to port $port after ${config.socks5BindRetries} retries"
                             )
-                            showProxyErrorNotification(config, port)
+                            // showProxyErrorNotification(config, port) // spamming with system notifications
                             return@withContext
                         }
                     }
@@ -437,7 +481,7 @@ class SshForegroundService : Service() {
 
                 while (isActive && serverSocket?.isClosed == false) {
                     val clientSocket = try {
-                        serverSocket?.accept()
+                        serverSocket.accept()
                     } catch (e: Exception) {
                         null
                     }
@@ -462,17 +506,18 @@ class SshForegroundService : Service() {
                     val output = s.getOutputStream()
 
                     val version = input.read()
+                    if (version == -1) return@withContext // connection closed immediately
                     if (version != 5) return@withContext
 
                     val nMethods = input.read()
                     if (nMethods <= 0) return@withContext
 
                     val methods = ByteArray(nMethods)
-                    var methodsRead = 0
-                    while (methodsRead < nMethods) {
-                        val read = input.read(methods, methodsRead, nMethods - methodsRead)
-                        if (read == -1) return@withContext
-                        methodsRead += read
+                    // Use existing readFully helper to ensure we get all method bytes
+                    try {
+                        input.readFully(methods)
+                    } catch (e: Exception) {
+                        return@withContext
                     }
 
                     output.write(byteArrayOf(5, 0))
@@ -482,27 +527,27 @@ class SshForegroundService : Service() {
                     if (ver != 5) return@withContext
                     val cmd = input.read()
                     input.read() // RSV
-                    val atyp = input.read()
+                    val aType = input.read()
 
-                    val targetHost = when (atyp) {
+                    val targetHost = when (aType) {
                         1 -> {
-                            val addr = ByteArray(4)
-                            input.readFully(addr)
-                            java.net.InetAddress.getByAddress(addr).hostAddress
+                            val address = ByteArray(4)
+                            input.readFully(address)
+                            java.net.InetAddress.getByAddress(address).hostAddress
                         }
 
                         3 -> {
                             val len = input.read()
                             if (len <= 0 || len > 255) return@withContext
-                            val addr = ByteArray(len)
-                            input.readFully(addr)
-                            String(addr)
+                            val address = ByteArray(len)
+                            input.readFully(address)
+                            String(address)
                         }
 
                         4 -> { // IPv6
-                            val addr = ByteArray(16)
-                            input.readFully(addr)
-                            java.net.InetAddress.getByAddress(addr).hostAddress
+                            val address = ByteArray(16)
+                            input.readFully(address)
+                            java.net.InetAddress.getByAddress(address).hostAddress?.split("%")[0]
                         }
 
                         else -> return@withContext
@@ -519,9 +564,19 @@ class SshForegroundService : Service() {
                         output.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
                         output.flush()
 
-                        coroutineScope {
-                            launch { pipe(input, channel.outputStream) }
-                            launch { pipe(channel.inputStream, output) }
+                        try{ coroutineScope {
+                            val jobIn = launch { pipe(this, input, channel.outputStream) }
+                            val jobOut = launch { pipe(this, channel.inputStream, output) }
+
+                            // Wait for the FIRST one to finish, then cancel the other
+                            // This is the "Race" pattern
+                            select<Unit> {
+                                jobIn.onJoin { jobOut.cancel() }
+                                jobOut.onJoin { jobIn.cancel() }
+                            }
+                        }
+                        } catch (e: CancellationException) {
+                            // Normal behavior when we cancel the second job
                         }
                     }
                 } catch (e: Exception) {
@@ -539,18 +594,27 @@ class SshForegroundService : Service() {
         }
     }
 
-    private fun pipe(from: InputStream, to: OutputStream) {
+    private fun pipe(scope: CoroutineScope, from: InputStream, to: OutputStream) {
         val buffer = ByteArray(16384)
         try {
             var read: Int
-            while (from.read(buffer).also { read = it } != -1) {
+            while (scope.isActive) {
+                read = from.read(buffer)
+                if (read == -1) break
                 if (read > 0) {
                     to.write(buffer, 0, read)
                     to.flush()
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Pipe error during SOCKS5 forwarding: ${e.message}")
+            // Log only if it's not a normal closure
+            if (e !is java.net.SocketException) {
+                Log.w(TAG, "Pipe error: ${e.message}")
+            }
+        } finally {
+            // This is correct: closing the stream unblocks the other thread's read()
+            try { to.close() } catch (_: Exception) {}
+            try { from.close() } catch (_: Exception) {}
         }
     }
 
