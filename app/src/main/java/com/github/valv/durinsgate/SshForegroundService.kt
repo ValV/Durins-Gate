@@ -128,6 +128,8 @@ class SshForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        //updateSummaryNotification()
+
         if (intent == null) {
             restoreTunnelsFromStorage()
             return START_STICKY
