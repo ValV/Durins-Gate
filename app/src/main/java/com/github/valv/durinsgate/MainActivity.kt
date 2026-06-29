@@ -6,7 +6,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
@@ -19,14 +18,17 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.github.valv.durinsgate.databinding.ActivityMainBinding
 import com.github.valv.durinsgate.databinding.DialogEditConfigBinding
 import com.github.valv.durinsgate.databinding.DialogManageKeysBinding
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
 
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
@@ -41,9 +43,16 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestPermission()
     ) { isGranted: Boolean ->
         if (!isGranted) {
-            Toast.makeText(this, "Notification permission is required", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                "Notification permission is required",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
+
+    private var pollingJob: kotlinx.coroutines.Job? = null
+    private var logCollectionJob: kotlinx.coroutines.Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,11 +68,22 @@ class MainActivity : AppCompatActivity() {
         setupLogs()
         checkPermissions()
         checkBatteryOptimizations()
-        startStatePolling()
 
         restoreTunnels()
 
         binding.fabAdd.setOnClickListener { showEditDialog(null) }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        startStatePolling()
+        setupLogs()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        pollingJob?.cancel()
+        logCollectionJob?.cancel()
     }
 
     private fun setupToolbar() {
@@ -80,13 +100,17 @@ class MainActivity : AppCompatActivity() {
                 iconTapCount = 0
                 startActivity(Intent(this, AdvancedConfigActivity::class.java))
             } else if (iconTapCount > 3) {
-                Toast.makeText(this, "You are ${7 - iconTapCount} steps away from advanced settings", Toast.LENGTH_SHORT).show()
+                Toast.makeText(
+                    this,
+                    "You are ${7 - iconTapCount} steps away from advanced settings",
+                    Toast.LENGTH_SHORT
+                ).show()
             }
         }
     }
 
     private fun checkBatteryOptimizations() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
                 AlertDialog.Builder(this)
@@ -95,7 +119,7 @@ class MainActivity : AppCompatActivity() {
                     .setPositiveButton("Settings") { _, _ ->
                         val intent =
                             Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                                data = Uri.parse("package:$packageName")
+                                data = "package:$packageName".toUri()
                             }
                         startActivity(intent)
                     }
@@ -152,7 +176,9 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, SshForegroundService::class.java).apply {
             putExtra(SshForegroundService.EXTRA_CONFIG_ID, config.id)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(
+            intent
+        ) else startService(
             intent
         )
     }
@@ -166,9 +192,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startStatePolling() {
-        lifecycleScope.launch {
+        pollingJob?.cancel() // safeguard
+        pollingJob = lifecycleScope.launch {
             while (true) {
-                adapter.notifyDataSetChanged()
+                try {
+                    adapter.notifyDataSetChanged()
+                } catch (e: Exception) {
+                    break
+                }
                 delay(2000)
             }
         }
@@ -186,11 +217,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+//    private fun setupLogs() {
+//        lifecycleScope.launch {
+//            LogRepository.logs.collectLatest { message ->
+//                binding.tvLogs.append("\n$message")
+//                binding.logScrollView.post { binding.logScrollView.fullScroll(android.view.View.FOCUS_DOWN) }
+//            }
+//        }
+//    }
+
     private fun setupLogs() {
-        lifecycleScope.launch {
-            LogRepository.logs.collectLatest { message ->
+        logCollectionJob?.cancel() // safeguard
+        binding.tvLogs.text = "Waiting for connection..." // clear old replayed logs from screen
+        logCollectionJob = lifecycleScope.launch {
+            LogRepository.logs.collect { message ->
                 binding.tvLogs.append("\n$message")
-                binding.logScrollView.post { binding.logScrollView.fullScroll(android.view.View.FOCUS_DOWN) }
+                binding.logScrollView.post {
+                    binding.logScrollView.fullScroll(android.view.View.FOCUS_DOWN)
+                }
             }
         }
     }
@@ -285,17 +329,43 @@ class MainActivity : AppCompatActivity() {
         keyDialogBinding.btnGenEd.setOnClickListener {
             val name = keyDialogBinding.etNewKeyName.text.toString()
                 .ifBlank { "ed_${System.currentTimeMillis()}" }
-            keyManager.generateEd25519Key(name)
-            keyAdapter.updateKeys(keyManager.listKeys())
-            keyDialogBinding.etNewKeyName.text?.clear()
+            keyDialogBinding.btnGenEd.isEnabled = false
+            keyDialogBinding.btnGenRsa.isEnabled = false
+            lifecycleScope.launch(Dispatchers.Default) {
+                try {
+                    keyManager.generateEd25519Key(name)
+                    withContext(Dispatchers.Main) {
+                        keyAdapter?.updateKeys(keyManager.listKeys())
+                        keyDialogBinding.etNewKeyName.text?.clear()
+                    }
+                } finally {
+                    withContext(Dispatchers.Main) {
+                        keyDialogBinding.btnGenEd.isEnabled = true
+                        keyDialogBinding.btnGenRsa.isEnabled = true
+                    }
+                }
+            }
         }
 
         keyDialogBinding.btnGenRsa.setOnClickListener {
             val name = keyDialogBinding.etNewKeyName.text.toString()
                 .ifBlank { "rsa_${System.currentTimeMillis()}" }
-            keyManager.generateRSAKey(name, 4096)
-            keyAdapter.updateKeys(keyManager.listKeys())
-            keyDialogBinding.etNewKeyName.text?.clear()
+            keyDialogBinding.btnGenEd.isEnabled = false
+            keyDialogBinding.btnGenRsa.isEnabled = false
+            lifecycleScope.launch(Dispatchers.Default) {
+                try {
+                    keyManager.generateRSAKey(name, 4096)
+                    withContext(Dispatchers.Main) {
+                        keyAdapter?.updateKeys(keyManager.listKeys())
+                        keyDialogBinding.etNewKeyName.text?.clear()
+                    }
+                } finally {
+                    withContext(Dispatchers.Main) {
+                        keyDialogBinding.btnGenEd.isEnabled = true
+                        keyDialogBinding.btnGenRsa.isEnabled = true
+                    }
+                }
+            }
         }
 
         AlertDialog.Builder(this)
