@@ -19,6 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.github.valv.durinsgate.databinding.ActivityMainBinding
@@ -26,6 +27,7 @@ import com.github.valv.durinsgate.databinding.DialogEditConfigBinding
 import com.github.valv.durinsgate.databinding.DialogManageKeysBinding
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
@@ -168,7 +170,12 @@ class MainActivity : AppCompatActivity() {
     private fun startStatePolling() {
         lifecycleScope.launch {
             while (true) {
-                adapter.notifyDataSetChanged()
+                if (!isActive) break
+                try {
+                    adapter.notifyDataSetChanged()
+                } catch (e: Exception) {
+                    break
+                }
                 delay(2000)
             }
         }

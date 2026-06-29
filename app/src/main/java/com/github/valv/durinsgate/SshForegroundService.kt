@@ -46,10 +46,11 @@ class SshForegroundService : Service() {
     private val activeClients = ConcurrentHashMap<String, SSHClient>()
     private val activeJobs = ConcurrentHashMap<String, Job>()
     private val activeProxies = ConcurrentHashMap<String, ServerSocket>()
-    private val retryCounts = ConcurrentHashMap<String, Int>()
+    //private val retryCounts = ConcurrentHashMap<String, Int>()
+    private val retryCounts = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var currentNetwork: Network? = null
+    @Volatile private var currentNetwork: Network? = null
 
     companion object {
         const val TAG = "SshService"
@@ -184,50 +185,67 @@ class SshForegroundService : Service() {
     }
 
     private fun startConfig(config: SshConfig) {
-        synchronized(activeJobs) {
+//        synchronized(activeJobs) {
+        val shouldStart = synchronized(activeJobs) {
+
             // Prevent duplicate jobs for the same config
-            if (activeJobs.containsKey(config.id)) return
+            if (activeJobs.containsKey(config.id)) return@synchronized false  // already running
 
-            // 1. Acquire WakeLock outside the coroutine to ensure it's held immediately
-            if (wakeLock?.isHeld == false) {
-                try {
-                    wakeLock?.acquire(config.timeoutWakeLock)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to acquire wake lock", e)
-                }
-            }
-
-            // 2. Add to active set IMMEDIATELY before launching.
-            // This ensures isConfigActive() is true for the UI Adapter right away
-            synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
-
-            // 3. Launch the worker
-            val job = serviceScope.launch {
-                try {
-                    // Add to active set only once the attempt actually starts
-                    establishTunnel(config)
-                } catch (e: CancellationException) {
-                    // Shutdown
-                } catch (e: Exception) {
-                    Log.e(TAG, "Tunnel execution failed for ${config.name}", e)
-                    if (e !is HostKeyVerificationException) {
-                        val current = retryCounts[config.id] ?: 0
-                        retryCounts[config.id] = current + 1
-                    }
-                    // If it's a verification exception, we might want to notify UI
-                    if (e is HostKeyVerificationException) {
-                        withContext(Dispatchers.Main) {
-                            showVerificationNotification(config)
-                        }
-                    }
-                } finally {
-                    // 4. This is the only place we remove and refresh
-                    onConfigDisconnected(config.id)
-                }
-            }
-            activeJobs[config.id] = job
-
+            // Register a placeholder job so other threads know we're starting
+            activeJobs[config.id] = Job()
+            true
         }
+
+        if (!shouldStart) return
+
+        // Now we can safely add to _activeConfigIds
+        // 1. Add to active set IMMEDIATELY before launching.
+        // This ensures isConfigActive() is true for the UI Adapter right away
+        synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
+
+        // 2. Acquire WakeLock outside the coroutine to ensure it's held immediately
+        if (wakeLock?.isHeld == false) {
+            try {
+                wakeLock?.acquire(config.timeoutWakeLock)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to acquire wake lock", e)
+            }
+        }
+
+        // 3. Launch the worker
+        val job = serviceScope.launch {
+            try {
+                // Add to active set only once the attempt actually starts
+                establishTunnel(config)
+            } catch (e: CancellationException) {
+                // Shutdown
+            } catch (e: Exception) {
+                Log.e(TAG, "Tunnel execution failed for ${config.name}", e)
+                if (e !is HostKeyVerificationException) {
+                    //val current = retryCounts[config.id] ?: 0
+                    //retryCounts[config.id] = current + 1
+                    retryCounts.getOrPut(config.id) {
+                        java.util.concurrent.atomic.AtomicInteger(0)
+                    }.incrementAndGet()
+                }
+                // If it's a verification exception, we might want to notify UI
+                if (e is HostKeyVerificationException) {
+                    withContext(Dispatchers.Main) {
+                        showVerificationNotification(config)
+                    }
+                }
+            } finally {
+                // 4. This is the only place we remove and refresh
+                onConfigDisconnected(config.id)
+            }
+        }
+
+        // Replace the placeholder
+        synchronized(activeJobs) {
+            activeJobs[config.id] = job
+        }
+        //activeJobs[config.id] = job
+        //}
         // 5. Update notification ONCE after the job is registered
         updateSummaryNotification()
     }
@@ -286,7 +304,7 @@ class SshForegroundService : Service() {
         val intent = Intent(this, HostKeyApprovalActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(EXTRA_CONFIG_ID, config.id)
-            putExtra("hostname", config.host)
+            //putExtra("hostname", config.host)
             putExtra("key", HostKeyVerifierManager.getLookupKey(config.host, config.port))
         }
         val pendingIntent = PendingIntent.getActivity(
@@ -353,11 +371,21 @@ class SshForegroundService : Service() {
     }
 
     private fun onConfigDisconnected(configId: String) {
+        var isNowEmpty = false
         synchronized(activeJobs) {
             activeJobs.remove(configId)
             activeClients.remove(configId)
             activeProxies.remove(configId)
-            synchronized(_activeConfigIds) { _activeConfigIds.remove(configId) }
+            //synchronized(_activeConfigIds) { _activeConfigIds.remove(configId) }
+            synchronized(_activeConfigIds) {
+                _activeConfigIds.remove(configId)
+                isNowEmpty = _activeConfigIds.isEmpty()
+            }
+        }
+
+        // Use the snapshot
+        if (isNowEmpty) {
+            // Handle empty case synchronously
         }
 
         // Synchronous update
@@ -377,7 +405,7 @@ class SshForegroundService : Service() {
                     //updateSummaryNotification()
                     if (config?.isEnabled == true && currentNetwork != null) {
                         val lookupKey = HostKeyVerifierManager.getLookupKey(config.host, config.port)
-                        val pending = HostKeyVerifierManager.pendingVerifications[config.host]
+                        val pending = HostKeyVerifierManager.pendingVerifications[lookupKey]
                         val isPending = pending != null
                         val isStale = isPending && (System.currentTimeMillis() - pending.second > config.verificationExpiry)
 
@@ -386,7 +414,9 @@ class SshForegroundService : Service() {
                                 HostKeyVerifierManager.pendingVerifications.remove(lookupKey)
                             }
 
-                            val retryCount = retryCounts[configId] ?: 0
+                            //val retryCount = retryCounts[configId] ?: 0
+                            val retryCount = retryCounts[configId]?.get() ?: 0
+
                             val delayMs = if (retryCount > 0) {
                                 (config.timeoutVerificationRetry * config.backoffMultiplier.pow((retryCount - 1).toDouble()))
                                     .toLong().coerceAtMost(config.maxRetryDelay)
@@ -454,7 +484,11 @@ class SshForegroundService : Service() {
 
             if (client.isAuthenticated) {
                 LogRepository.log("Gate Open: ${config.name}")
-                retryCounts[config.id] = 0
+                retryCounts[config.id]?.set(0) ?: retryCounts.put(
+                    config.id, java.util.concurrent.atomic.AtomicInteger(0)
+                )
+
+                //retryCounts[config.id] = 0
                 //synchronized(_activeConfigIds) { _activeConfigIds.add(config.id) }
                 //updateSummaryNotification()
 
