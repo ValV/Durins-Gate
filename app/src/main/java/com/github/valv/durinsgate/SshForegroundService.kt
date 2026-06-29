@@ -255,7 +255,7 @@ class SshForegroundService : Service() {
                         }
 
                         LogRepository.log("Gate Open: ${freshConfig.name}")
-                        retryCount = 0 // Reset exponential backoff on successful connect
+                        retryCount = 0 // reset exponential backoff on successful connect
                         updateSummaryNotification()
 
                         if (freshConfig.isSocks5) {
@@ -276,6 +276,8 @@ class SshForegroundService : Service() {
 
                         val session = TunnelSession(client, serverSocket, tunnelJob)
                         activeTunnels[freshConfig.id] = session
+
+                        updateSummaryNotification()
 
                         coroutineScope {
                             if (serverSocket != null) {
