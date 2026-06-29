@@ -62,7 +62,8 @@ class SshForegroundService : Service() {
 
     companion object {
         const val TAG = "SshService"
-        const val CHANNEL_ID = "ssh_tunnel_channel"
+        const val CHANNEL_ID = "ssh_ongoing_channel" // force system migration to silent channel
+        const val CHANNEL_ID_ALERT = "ssh_alert_channel" // separate channel for user-facing security warnings
         const val NOTIFICATION_ID = 1
         const val ACTION_STOP_ALL = "STOP_ALL"
         const val ACTION_STOP_CONFIG = "STOP_CONFIG"
@@ -79,6 +80,7 @@ class SshForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        updateSummaryNotification()
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK, "DurinsGate::SSH_WakeLock"
@@ -257,10 +259,19 @@ class SshForegroundService : Service() {
                         updateSummaryNotification()
 
                         if (freshConfig.isSocks5) {
-                            serverSocket = ServerSocket().apply {
-                                reuseAddress = true
-                                bind(InetSocketAddress("127.0.0.1", freshConfig.localPort))
+                            try {
+                                serverSocket = ServerSocket().apply {
+                                    reuseAddress = true
+                                    bind(InetSocketAddress("127.0.0.1", freshConfig.localPort))
+                                }
+                            } catch (e: java.net.BindException) {
+                                // --- TERMINATE RECONNECT LOOPS ON PORT OCCUPATION START ---
+                                LogRepository.log("Gate [${freshConfig.name}] SOCKS5 Bind Error: Port ${freshConfig.localPort} is already in use!")
+                                //showProxyErrorNotification(freshConfig, freshConfig.localPort)
+                                break
+                                // --- TERMINATE RECONNECT LOOPS ON PORT OCCUPATION END ---
                             }
+
                         }
 
                         val session = TunnelSession(client, serverSocket, tunnelJob)
@@ -486,7 +497,7 @@ class SshForegroundService : Service() {
             intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID_ALERT)
             .setContentTitle("Security Verification Required")
             .setContentText("Gate [${config.name}] encountered an unknown host key.")
             .setSmallIcon(R.drawable.ic_notification_gate)
@@ -518,7 +529,8 @@ class SshForegroundService : Service() {
             .setOngoing(true)
             .setContentIntent(pendingMainIntent)
             .addAction(R.drawable.ic_notification_gate, "Stop All", stopPendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
@@ -526,13 +538,29 @@ class SshForegroundService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel =
-                NotificationChannel(
-                    CHANNEL_ID, "SSH", NotificationManager.IMPORTANCE_HIGH
-                )
-            getSystemService(
-                NotificationManager::class.java
-            ).createNotificationChannel(channel)
+            val manager = getSystemService(NotificationManager::class.java)
+
+            // Channel 1: Silent Tunnel Service Status Channel
+            val ongoingChannel = NotificationChannel(
+                CHANNEL_ID,
+                "Tunnel Service Status",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Displays ongoing tunnel connection statuses. Always silent."
+                setShowBadge(false)
+            }
+
+            // Channel 2: High-Priority Warnings & Approvals Channel
+            val alertChannel = NotificationChannel(
+                CHANNEL_ID_ALERT,
+                "Tunnel Warnings & Security",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Audibly alerts when host verification or approvals are required."
+            }
+
+            manager.createNotificationChannel(ongoingChannel)
+            manager.createNotificationChannel(alertChannel)
         }
     }
 

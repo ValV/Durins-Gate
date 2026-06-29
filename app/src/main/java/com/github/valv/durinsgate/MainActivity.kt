@@ -329,17 +329,43 @@ class MainActivity : AppCompatActivity() {
         keyDialogBinding.btnGenEd.setOnClickListener {
             val name = keyDialogBinding.etNewKeyName.text.toString()
                 .ifBlank { "ed_${System.currentTimeMillis()}" }
-            keyManager.generateEd25519Key(name)
-            keyAdapter.updateKeys(keyManager.listKeys())
-            keyDialogBinding.etNewKeyName.text?.clear()
+            keyDialogBinding.btnGenEd.isEnabled = false
+            keyDialogBinding.btnGenRsa.isEnabled = false
+            lifecycleScope.launch(Dispatchers.Default) {
+                try {
+                    keyManager.generateEd25519Key(name)
+                    withContext(Dispatchers.Main) {
+                        keyAdapter?.updateKeys(keyManager.listKeys())
+                        keyDialogBinding.etNewKeyName.text?.clear()
+                    }
+                } finally {
+                    withContext(Dispatchers.Main) {
+                        keyDialogBinding.btnGenEd.isEnabled = true
+                        keyDialogBinding.btnGenRsa.isEnabled = true
+                    }
+                }
+            }
         }
 
         keyDialogBinding.btnGenRsa.setOnClickListener {
             val name = keyDialogBinding.etNewKeyName.text.toString()
                 .ifBlank { "rsa_${System.currentTimeMillis()}" }
-            keyManager.generateRSAKey(name, 4096)
-            keyAdapter.updateKeys(keyManager.listKeys())
-            keyDialogBinding.etNewKeyName.text?.clear()
+            keyDialogBinding.btnGenEd.isEnabled = false
+            keyDialogBinding.btnGenRsa.isEnabled = false
+            lifecycleScope.launch(Dispatchers.Default) {
+                try {
+                    keyManager.generateRSAKey(name, 4096)
+                    withContext(Dispatchers.Main) {
+                        keyAdapter?.updateKeys(keyManager.listKeys())
+                        keyDialogBinding.etNewKeyName.text?.clear()
+                    }
+                } finally {
+                    withContext(Dispatchers.Main) {
+                        keyDialogBinding.btnGenEd.isEnabled = true
+                        keyDialogBinding.btnGenRsa.isEnabled = true
+                    }
+                }
+            }
         }
 
         AlertDialog.Builder(this)
