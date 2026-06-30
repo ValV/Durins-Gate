@@ -51,7 +51,7 @@ class SshForegroundService : Service() {
     private var idleMonitorJob: Job? = null
 
     // --- ENHANCED TUNNEL SESSION FOR ON-DEMAND CONNECTIVITY ---
-    private class TunnelSession(
+    private inner class TunnelSession(
         val config: SshConfig,
         val serverSocket: ServerSocket?,
         val parentJob: Job
@@ -76,7 +76,27 @@ class SshForegroundService : Service() {
                 newClient.timeout = config.timeoutClient
 
                 LogRepository.log("Gate [${config.name}]: Connecting on-demand...")
-                newClient.connect(config.host, config.port)
+
+                try {
+                    newClient.connect(config.host, config.port)
+                } catch (e: Exception) {
+                    var cause: Throwable? = e
+                    while (cause != null) {
+                        if (cause is HostKeyVerificationException) {
+                            val lookupKey = HostKeyVerifierManager.getLookupKey(
+                                cause.hostname, cause.port
+                            )
+                            HostKeyVerifierManager.pendingVerifications[lookupKey] = Pair(
+                                cause, System.currentTimeMillis()
+                            )
+                            showVerificationNotification(config)
+                            LogRepository.log("Gate [${config.name}]: Host verification required.")
+                            throw cause
+                        }
+                        cause = cause.cause
+                    }
+                    throw e
+                }
 
                 config.keyAlias?.let { alias ->
                     LogRepository.log("Gate [${config.name}]: Authenticating...")
