@@ -10,6 +10,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  HAS_SIGNING_KEYS: ${{ secrets.SIGNING_KEY != '' && secrets.ALIAS != '' }}
 
 jobs:
   build:
@@ -88,6 +89,19 @@ jobs:
       - name: Build Release APK
         run: ./gradlew :app:assembleRelease --no-daemon --info --stacktrace
 
+      - name: Sign App APK
+        if: ${{ env.HAS_SIGNING_KEYS == 'true' }}
+        id: sign_app
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: "34.0.0" # overrides build-tools using the action's supported environment variable
+
       - name: Rename APK with Comprehensive Metadata
         shell: bash
         run: |
@@ -99,21 +113,24 @@ jobs:
           COMMIT_SHA="${{ github.sha }}"
           SHORT_SHA="${COMMIT_SHA:0:8}"
 
-          # Find the built APK
-          ORIGINAL_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          # --- SELECT SIGNED OR FALLBACK TO UNSIGNED APK ---
+          SIGNED_APK="${{ steps.sign_app.outputs.signedReleaseFile }}"
+          if [ -n "$SIGNED_APK" ] && [ -f "$SIGNED_APK" ]; then
+            ORIGINAL_APK="$SIGNED_APK"
+            echo "Using cryptographically signed APK."
+          else
+            ORIGINAL_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+            echo "Signing keys are missing or run skipped. Falling back to unsigned APK."
+          fi
 
           if [ -f "$ORIGINAL_APK" ]; then
-            # Create comprehensive APK name: DurinsGate-v{version}-{tag}-b{build}-{commit}.apk
-            #NEW_APK_NAME="DurinsGate-v${VERSION}-${TAG}-b${RUN_NUMBER}-${SHORT_SHA}.apk"
             NEW_APK_NAME="DurinsGate-${TAG}.apk"
             NEW_APK_PATH="app/build/outputs/apk/release/${NEW_APK_NAME}"
-
-            # Rename the APK
             mv "$ORIGINAL_APK" "$NEW_APK_PATH"
             echo "APK renamed to: $NEW_APK_NAME"
             echo "APK_NAME=$NEW_APK_NAME" >> $GITHUB_ENV
           else
-            echo "Error: Original APK not found at $ORIGINAL_APK"
+            echo "Error: Target APK not found at $ORIGINAL_APK"
             exit 1
           fi
 
