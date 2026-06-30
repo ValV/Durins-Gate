@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">Durin\'s Gate</string>
+    <string name="host_key_approval_warning_mismatch">WARNING: HOST KEY MISMATCH</string>
+    <string name="host_key_approval_mismatch_message">The host key has changed! This could be a man-in-the-middle attack.</string>
+    <string name="host_key_approval_new_title">New Host Key</string>
+    <string name="host_key_approval_new_message">The authenticity of the host cannot be established. Do you want to trust this key?</string>
 </resources>

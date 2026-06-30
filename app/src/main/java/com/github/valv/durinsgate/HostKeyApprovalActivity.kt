@@ -13,9 +13,11 @@ class HostKeyApprovalActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_host_key_approval)
 
-        val hostname = intent.getStringExtra("hostname") ?: ""
+        val lookupKey = intent.getStringExtra("key") ?: ""
         val configId = intent.getStringExtra(SshForegroundService.EXTRA_CONFIG_ID)
-        val exception = HostKeyVerifierManager.pendingVerifications[hostname]
+
+        val pair = HostKeyVerifierManager.pendingVerifications[lookupKey]
+        val exception = pair?.first
 
         if (exception == null) {
             finish()
@@ -30,13 +32,13 @@ class HostKeyApprovalActivity : AppCompatActivity() {
         val btnCancel = findViewById<Button>(R.id.btn_cancel)
 
         if (exception.isMismatch) {
-            tvTitle.text = "WARNING: HOST KEY MISMATCH"
+            tvTitle.text = getString(R.string.host_key_approval_warning_mismatch)
             tvTitle.setTextColor(getColor(android.R.color.holo_red_dark))
-            tvMessage.text = "The host key has changed! This could be a man-in-the-middle attack."
+            tvMessage.text = getString(R.string.host_key_approval_mismatch_message)
         } else {
-            tvTitle.text = "New Host Key"
+            tvTitle.text = getString(R.string.host_key_approval_new_title)
             tvMessage.text =
-                "The authenticity of the host cannot be established. Do you want to trust this key?"
+                getString(R.string.host_key_approval_new_message)
         }
 
         tvHostInfo.text = "${exception.hostname}:${exception.port}"
@@ -46,11 +48,11 @@ class HostKeyApprovalActivity : AppCompatActivity() {
             val manager = HostKeyVerifierManager(this)
             manager.addHostKey(exception.hostname, exception.port, exception.publicKey)
 
-            HostKeyVerifierManager.pendingVerifications.remove(hostname)
+            HostKeyVerifierManager.pendingVerifications.remove(lookupKey)
 
             // Dismiss notification
             val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            nm.cancel(hostname.hashCode())
+            nm.cancel(exception.hostname.hashCode())
 
             // Signal service to retry
             if (configId != null) {
@@ -65,9 +67,9 @@ class HostKeyApprovalActivity : AppCompatActivity() {
         }
 
         btnCancel.setOnClickListener {
-            HostKeyVerifierManager.pendingVerifications.remove(hostname)
+            HostKeyVerifierManager.pendingVerifications.remove(lookupKey)
             val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            nm.cancel(hostname.hashCode())
+            nm.cancel(exception.hostname.hashCode())
             finish()
         }
     }

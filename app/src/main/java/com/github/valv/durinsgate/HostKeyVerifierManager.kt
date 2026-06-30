@@ -38,7 +38,7 @@ class HostKeyVerifierManager(private val context: Context) {
             override fun verify(hostname: String, port: Int, key: PublicKey): Boolean {
                 val result = delegate.verify(hostname, port, key)
                 if (!result) {
-                    val isMismatch = isHostKnown(hostname)
+                    val isMismatch = isHostKnown(hostname, port)
                     throw HostKeyVerificationException(hostname, port, key, isMismatch)
                 }
                 return true
@@ -79,7 +79,11 @@ class HostKeyVerifierManager(private val context: Context) {
 
             synchronized(this) {
                 val lines = if (knownHostsFile.exists()) knownHostsFile.readLines() else emptyList()
-                val filteredLines = lines.filter { !it.contains("[$hostname]:$port") }
+                // Fix 2: Exact matching for replacement
+                val filteredLines = lines.filter { line ->
+                    val parts = line.split(" ")
+                    parts.isEmpty() || parts[0] != "[$hostname]:$port"
+                }
                 val newContent = filteredLines.toMutableList()
                 newContent.add(entry)
                 knownHostsFile.writeText(newContent.joinToString("\n") + "\n")
@@ -91,10 +95,15 @@ class HostKeyVerifierManager(private val context: Context) {
         }
     }
 
-    fun isHostKnown(hostname: String): Boolean {
+    fun isHostKnown(hostname: String, port: Int): Boolean {
         return try {
             if (!knownHostsFile.exists()) return false
-            knownHostsFile.readLines().any { it.contains("[$hostname]") }
+            // Fix 2: Exact matching of [hostname]:port
+            val target = "[$hostname]:$port"
+            knownHostsFile.readLines().any { line ->
+                val parts = line.split(" ")
+                parts.isNotEmpty() && parts[0] == target
+            }
         } catch (e: Exception) {
             false
         }
@@ -106,8 +115,6 @@ class HostKeyVerifierManager(private val context: Context) {
             val parts = line.split(" ")
             val host = parts.getOrNull(0) ?: "Unknown"
             val type = parts.getOrNull(1) ?: ""
-            // We could parse the key to get fingerprint, but maybe just showing the host is enough for now
-            // or we use a placeholder if we don't want to parse it here.
             KnownHostEntry(line, host, type, "")
         }
     }
@@ -122,7 +129,9 @@ class HostKeyVerifierManager(private val context: Context) {
     }
 
     companion object {
-        val pendingVerifications = ConcurrentHashMap<String, HostKeyVerificationException>()
+        val pendingVerifications = ConcurrentHashMap<String, Pair<HostKeyVerificationException, Long>>()
+
+        fun getLookupKey(hostname: String, port: Int): String = "[$hostname]:$port"
 
         fun getFingerprint(key: PublicKey): String {
             return net.schmizz.sshj.common.SecurityUtils.getFingerprint(key)
