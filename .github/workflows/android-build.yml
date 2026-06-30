@@ -99,21 +99,16 @@ jobs:
           COMMIT_SHA="${{ github.sha }}"
           SHORT_SHA="${COMMIT_SHA:0:8}"
 
-          # Find the built APK
-          ORIGINAL_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
-
-          if [ -f "$ORIGINAL_APK" ]; then
-            # Create comprehensive APK name: DurinsGate-v{version}-{tag}-b{build}-{commit}.apk
-            #NEW_APK_NAME="DurinsGate-v${VERSION}-${TAG}-b${RUN_NUMBER}-${SHORT_SHA}.apk"
+          # --- RENAME THE CRYPTOGRAPHICALLY SIGNED FILE ---
+          SIGNED_APK="${{ steps.sign_app.outputs.signedReleaseFile }}"
+          if [ -f "$SIGNED_APK" ]; then
             NEW_APK_NAME="DurinsGate-${TAG}.apk"
             NEW_APK_PATH="app/build/outputs/apk/release/${NEW_APK_NAME}"
-
-            # Rename the APK
-            mv "$ORIGINAL_APK" "$NEW_APK_PATH"
+            mv "$SIGNED_APK" "$NEW_APK_PATH"
             echo "APK renamed to: $NEW_APK_NAME"
             echo "APK_NAME=$NEW_APK_NAME" >> $GITHUB_ENV
           else
-            echo "Error: Original APK not found at $ORIGINAL_APK"
+            echo "Error: Signed APK not found at $SIGNED_APK"
             exit 1
           fi
 
