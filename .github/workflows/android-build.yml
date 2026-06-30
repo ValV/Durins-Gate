@@ -10,6 +10,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  HAS_SIGNING_KEYS: ${{ secrets.SIGNING_KEY != '' && secrets.ALIAS != '' }}
 
 jobs:
   build:
@@ -88,6 +89,16 @@ jobs:
       - name: Build Release APK
         run: ./gradlew :app:assembleRelease --no-daemon --info --stacktrace
 
+      - name: Sign App APK
+        id: sign_app
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
       - name: Rename APK with Comprehensive Metadata
         shell: bash
         run: |
@@ -99,7 +110,6 @@ jobs:
           COMMIT_SHA="${{ github.sha }}"
           SHORT_SHA="${COMMIT_SHA:0:8}"
 
-          # --- RENAME THE CRYPTOGRAPHICALLY SIGNED FILE ---
           SIGNED_APK="${{ steps.sign_app.outputs.signedReleaseFile }}"
           if [ -f "$SIGNED_APK" ]; then
             NEW_APK_NAME="DurinsGate-${TAG}.apk"
