@@ -22,5 +22,6 @@ data class SshConfig(
     var timeoutVerificationRetry: Long = 5000,
     var backoffMultiplier: Double = 2.0,
     var maxRetryDelay: Long = 10 * 60 * 1000L,
-    var isEnabled: Boolean = false
+    var isEnabled: Boolean = false,
+    var isPowerSave: Boolean = true
 ) : Serializable

@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
@@ -46,17 +48,83 @@ class SshForegroundService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var currentNetwork: Network? = null
+    private var idleMonitorJob: Job? = null
 
-    // Clean tracking wrapper for active tunnel components
+    // --- ENHANCED TUNNEL SESSION FOR ON-DEMAND CONNECTIVITY ---
     private class TunnelSession(
-        val client: SSHClient,
+        val config: SshConfig,
         val serverSocket: ServerSocket?,
-        val job: Job
+        val parentJob: Job
     ) {
+        private val connectionMutex = Mutex()
+        @Volatile var client: SSHClient? = null
+        @Volatile var lastActivityTime = System.currentTimeMillis()
+
+        suspend fun getOrConnectClient(context: Context): SSHClient {
+            return connectionMutex.withLock {
+                val currentClient = client
+                if (currentClient != null && currentClient.isConnected && currentClient.isAuthenticated) {
+                    lastActivityTime = System.currentTimeMillis()
+                    return@withLock currentClient
+                }
+                try { currentClient?.disconnect() } catch (e: Exception) {}
+
+                val newClient = SSHClient()
+                val verifierManager = HostKeyVerifierManager(context)
+                newClient.addHostKeyVerifier(verifierManager.getVerifier())
+                newClient.connectTimeout = config.timeoutConnect
+                newClient.timeout = config.timeoutClient
+
+                LogRepository.log("Gate [${config.name}]: Connecting on-demand...")
+                newClient.connect(config.host, config.port)
+
+                config.keyAlias?.let { alias ->
+                    LogRepository.log("Gate [${config.name}]: Authenticating...")
+                    val keyManager = KeyManager(context)
+                    newClient.authPublickey(
+                        config.username,
+                        newClient.loadKeys(keyManager.getPrivateKeyPath(alias))
+                    )
+                }
+                newClient.connection.keepAlive.keepAliveInterval = config.keepAliveInterval
+                if (!newClient.isAuthenticated) {
+                    throw Exception("Authentication failed")
+                }
+                LogRepository.log("Gate Open (On-Demand): ${config.name}")
+                client = newClient
+                lastActivityTime = System.currentTimeMillis()
+                newClient
+            }
+        }
+
+        fun disconnectClient() {
+            try { client?.disconnect() } catch (e: Exception) {}
+            client = null
+        }
+
         fun close() {
             try { serverSocket?.close() } catch (e: Exception) {}
-            try { client.disconnect() } catch (e: Exception) {}
-            job.cancel()
+            disconnectClient()
+            parentJob.cancel()
+        }
+    }
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == Intent.ACTION_SCREEN_ON || intent.action == Intent.ACTION_USER_PRESENT) {
+                Log.d(TAG, "Screen interactive trigger. Pre-warming SSH connections...")
+                serviceScope.launch {
+                    activeTunnels.values.forEach { session ->
+                        launch {
+                            try {
+                                session.getOrConnectClient(this@SshForegroundService)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Dynamic pre-warm failed for ${session.config.name}", e)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -90,7 +158,19 @@ class SshForegroundService : Service() {
             KeyManager(this@SshForegroundService).cleanupOrphanedKeys()
         }
 
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(screenReceiver, filter, RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(screenReceiver, filter)
+        }
+
         registerNetworkCallback()
+
+        startIdleMonitor()
     }
 
     private fun registerNetworkCallback() {
@@ -125,6 +205,30 @@ class SshForegroundService : Service() {
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
         connectivityManager.registerNetworkCallback(request, networkCallback!!)
+    }
+
+    private fun startIdleMonitor() {
+        if (idleMonitorJob?.isActive == true) return
+        idleMonitorJob = serviceScope.launch {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            while (isActive) {
+                delay(60000) // Validate idle periods once per minute
+                val now = System.currentTimeMillis()
+                val isScreenOff = !pm.isInteractive
+                activeTunnels.values.forEach { session ->
+                    val config = session.config
+                    // If power save is enabled, screen is off, and connection is idle for over 3 minutes
+                    if (config.isPowerSave && isScreenOff && (now - session.lastActivityTime > 180000)) {
+                        session.client?.let { client ->
+                            if (client.isConnected) {
+                                LogRepository.log("Gate [${config.name}]: Idle timeout. Sleeping physical link.")
+                                session.disconnectClient()
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -221,45 +325,6 @@ class SshForegroundService : Service() {
                     val tunnelJob = SupervisorJob()
 
                     try {
-                        val verifierManager = HostKeyVerifierManager(this@SshForegroundService)
-                        client.addHostKeyVerifier(verifierManager.getVerifier())
-                        client.connectTimeout = freshConfig.timeoutConnect
-                        client.timeout = freshConfig.timeoutClient
-
-                        LogRepository.log("Gate [${freshConfig.name}]: Connecting...")
-                        try {
-                            client.connect(freshConfig.host, freshConfig.port)
-                        } catch (e: Exception) {
-                            var cause: Throwable? = e
-                            while (cause != null) {
-                                if (cause is HostKeyVerificationException) {
-                                    val lookupKey = HostKeyVerifierManager.getLookupKey(cause.hostname, cause.port)
-                                    HostKeyVerifierManager.pendingVerifications[lookupKey] = Pair(cause, System.currentTimeMillis())
-                                    showVerificationNotification(freshConfig)
-                                    LogRepository.log("Gate [${freshConfig.name}]: Host verification required.")
-                                    throw cause
-                                }
-                                cause = cause.cause
-                            }
-                            throw e
-                        }
-
-                        freshConfig.keyAlias?.let { alias ->
-                            LogRepository.log("Gate [${freshConfig.name}]: Authenticating...")
-                            val keyManager = KeyManager(this@SshForegroundService)
-                            client.authPublickey(freshConfig.username, client.loadKeys(keyManager.getPrivateKeyPath(alias)))
-                        }
-
-                        client.connection.keepAlive.keepAliveInterval = freshConfig.keepAliveInterval
-
-                        if (!client.isAuthenticated) {
-                            throw Exception("Authentication failed")
-                        }
-
-                        LogRepository.log("Gate Open: ${freshConfig.name}")
-                        retryCount = 0 // reset exponential backoff on successful connect
-                        updateSummaryNotification()
-
                         if (freshConfig.isSocks5) {
                             try {
                                 serverSocket = ServerSocket().apply {
@@ -267,34 +332,46 @@ class SshForegroundService : Service() {
                                     bind(InetSocketAddress("127.0.0.1", freshConfig.localPort))
                                 }
                             } catch (e: java.net.BindException) {
-                                // --- TERMINATE RECONNECT LOOPS ON PORT OCCUPATION START ---
                                 LogRepository.log("Gate [${freshConfig.name}] SOCKS5 Bind Error: Port ${freshConfig.localPort} is already in use!")
-                                //showProxyErrorNotification(freshConfig, freshConfig.localPort)
                                 break
-                                // --- TERMINATE RECONNECT LOOPS ON PORT OCCUPATION END ---
                             }
-
                         }
 
-                        val session = TunnelSession(client, serverSocket, tunnelJob)
+                        val session = TunnelSession(freshConfig, serverSocket, tunnelJob)
                         activeTunnels[freshConfig.id] = session
 
+                        // Perform a single initial pre-warm connection on startup to verify authentication and keys
+                        try {
+                            session.getOrConnectClient(this@SshForegroundService)
+                        } catch (e: HostKeyVerificationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            // If power saving is active, swallow the initial error so it can retry lazily on demand
+                            if (!freshConfig.isPowerSave) throw e
+                        }
+
+                        retryCount = 0
                         updateSummaryNotification()
 
                         coroutineScope {
                             if (serverSocket != null) {
                                 launch(tunnelJob + Dispatchers.IO) {
-                                    runSocks5Server(freshConfig, client, serverSocket)
+                                    runSocks5Server(session, serverSocket)
                                 }
                             }
-                            // Relying on SSHJ's native background keepAlive system;
-                            // we only monitor connection status here
-                            while (isActive && client.isConnected) {
+                            // Connection monitoring loop
+                            while (isActive) {
+                                val activeSession = activeTunnels[freshConfig.id] ?: break
+                                val clientInstance = activeSession.client
+                                // Trigger reconnect only if the connection was active but crashed
+                                if (clientInstance != null && !clientInstance.isConnected) {
+                                    throw Exception("Physical connection closed unexpectedly")
+                                }
                                 delay(freshConfig.connectionCheckInterval)
                             }
                         }
                     } catch (e: HostKeyVerificationException) {
-                        break // Prevent retry loops when manual verification is needed
+                        break // prevent retry loops when manual verification is needed
                     } catch (e: Exception) {
                         if (!isActive) break
                         LogRepository.log("Gate [${freshConfig.name}] Error: ${e.message ?: "Connection Lost"}")
@@ -302,7 +379,6 @@ class SshForegroundService : Service() {
                         // Cleanup single tunnel instances immediately on disconnection
                         activeTunnels.remove(freshConfig.id)?.close()
                         try { serverSocket?.close() } catch (ex: Exception) {}
-                        try { client.disconnect() } catch (ex: Exception) {}
                         tunnelJob.cancel()
                         updateSummaryNotification()
                     }
@@ -352,7 +428,7 @@ class SshForegroundService : Service() {
         stopSelf()
     }
 
-    private suspend fun runSocks5Server(config: SshConfig, ssh: SSHClient, serverSocket: ServerSocket) =
+    private suspend fun runSocks5Server(session: TunnelSession, serverSocket: ServerSocket) =
         withContext(Dispatchers.IO) {
             try {
                 while (isActive && !serverSocket.isClosed) {
@@ -362,7 +438,13 @@ class SshForegroundService : Service() {
                         null
                     }
                     if (clientSocket != null) {
-                        launch { handleSocks5Request(ssh, clientSocket) }
+                        launch {
+                            try {
+                                handleSocks5Request(session, clientSocket)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "SOCKS5 handle error", e)
+                            }
+                        }
                     }
                 }
             } finally {
@@ -370,7 +452,7 @@ class SshForegroundService : Service() {
             }
         }
 
-    private suspend fun handleSocks5Request(ssh: SSHClient, socket: Socket) =
+    private suspend fun handleSocks5Request(session: TunnelSession, socket: Socket) =
         withContext(Dispatchers.IO) {
             socket.use { s ->
                 try {
@@ -389,7 +471,7 @@ class SshForegroundService : Service() {
                     val ver = input.read()
                     if (ver != 5) return@withContext
                     val cmd = input.read()
-                    input.read() // Skip rsv byte
+                    input.read()
                     val aType = input.read()
                     val targetHost = when (aType) {
                         1 -> {
@@ -417,11 +499,22 @@ class SshForegroundService : Service() {
                     val targetPort = ((p1 and 0xFF) shl 8) or (p2 and 0xFF)
                     if (cmd != 1) return@withContext
 
+                    // Resolve the SSHClient connection on demand! (Mutual Exclusion connection handling)
+                    val ssh = try {
+                        session.getOrConnectClient(this@SshForegroundService)
+                    } catch (e: Exception) {
+                        LogRepository.log("Gate [${session.config.name}] On-Demand Connection Failed: ${e.message}")
+                        output.write(byteArrayOf(5, 4, 0, 1, 0, 0, 0, 0, 0, 0))
+                        output.flush()
+                        return@withContext
+                    }
+
                     ssh.newDirectConnection(targetHost, targetPort).use { channel ->
                         output.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
                         output.flush()
 
-                        // Simple, native stream copying without thread-blocking leaks
+                        session.lastActivityTime = System.currentTimeMillis()
+
                         coroutineScope {
                             val jobIn = launch {
                                 try {
@@ -430,6 +523,7 @@ class SshForegroundService : Service() {
                                 } finally {
                                     try { s.close() } catch (_: Exception) {}
                                     try { channel.close() } catch (_: Exception) {}
+                                    session.lastActivityTime = System.currentTimeMillis()
                                 }
                             }
                             val jobOut = launch {
@@ -439,6 +533,7 @@ class SshForegroundService : Service() {
                                 } finally {
                                     try { s.close() } catch (_: Exception) {}
                                     try { channel.close() } catch (_: Exception) {}
+                                    session.lastActivityTime = System.currentTimeMillis()
                                 }
                             }
                             joinAll(jobIn, jobOut)
@@ -504,7 +599,7 @@ class SshForegroundService : Service() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID_ALERT)
             .setContentTitle("Security Verification Required")
             .setContentText("Gate [${config.name}] encountered an unknown host key.")
-            .setSmallIcon(R.drawable.ic_notification_gate)
+            .setSmallIcon(R.drawable.ic_durins_gate_notification)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -529,10 +624,10 @@ class SshForegroundService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Durin's Gate")
             .setContentText(content)
-            .setSmallIcon(R.drawable.ic_notification_gate)
+            .setSmallIcon(R.drawable.ic_durins_gate_notification)
             .setOngoing(true)
             .setContentIntent(pendingMainIntent)
-            .addAction(R.drawable.ic_notification_gate, "Stop All", stopPendingIntent)
+            .addAction(R.drawable.ic_durins_gate_notification, "Stop All", stopPendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -575,6 +670,10 @@ class SshForegroundService : Service() {
             val manager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
             manager.unregisterNetworkCallback(it)
         }
+
+        try { unregisterReceiver(screenReceiver) } catch (e: Exception) {}
+        idleMonitorJob?.cancel()
+
         activeTunnels.values.forEach { it.close() }
         activeTunnels.clear()
         serviceJob.cancel()

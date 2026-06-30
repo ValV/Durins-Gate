@@ -86,6 +86,13 @@
             android:text="Enable Dynamic Port Forwarding (SOCKS5)"
             android:checked="true" />
 
+        <com.google.android.material.checkbox.MaterialCheckBox
+            android:id="@+id/cbPowerSave"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Enable Power Saving (On-Demand Connection)"
+            android:checked="true" />
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
