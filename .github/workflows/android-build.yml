@@ -99,6 +99,7 @@ jobs:
           alias: ${{ secrets.ALIAS }}
           keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
+          buildToolsVersion: "34.0.0" # directs signing step to use modern pre-installed SDK environments
 
       - name: Rename APK with Comprehensive Metadata
         shell: bash
