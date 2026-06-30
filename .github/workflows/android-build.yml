@@ -90,6 +90,7 @@ jobs:
         run: ./gradlew :app:assembleRelease --no-daemon --info --stacktrace
 
       - name: Sign App APK
+        if: ${{ env.HAS_SIGNING_KEYS == 'true' }}
         id: sign_app
         uses: r0adkll/sign-android-release@v1
         with:
@@ -110,15 +111,24 @@ jobs:
           COMMIT_SHA="${{ github.sha }}"
           SHORT_SHA="${COMMIT_SHA:0:8}"
 
+          # --- SELECT SIGNED OR FALLBACK TO UNSIGNED APK ---
           SIGNED_APK="${{ steps.sign_app.outputs.signedReleaseFile }}"
-          if [ -f "$SIGNED_APK" ]; then
+          if [ -n "$SIGNED_APK" ] && [ -f "$SIGNED_APK" ]; then
+            ORIGINAL_APK="$SIGNED_APK"
+            echo "Using cryptographically signed APK."
+          else
+            ORIGINAL_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+            echo "Signing keys are missing or run skipped. Falling back to unsigned APK."
+          fi
+
+          if [ -f "$ORIGINAL_APK" ]; then
             NEW_APK_NAME="DurinsGate-${TAG}.apk"
             NEW_APK_PATH="app/build/outputs/apk/release/${NEW_APK_NAME}"
-            mv "$SIGNED_APK" "$NEW_APK_PATH"
+            mv "$ORIGINAL_APK" "$NEW_APK_PATH"
             echo "APK renamed to: $NEW_APK_NAME"
             echo "APK_NAME=$NEW_APK_NAME" >> $GITHUB_ENV
           else
-            echo "Error: Signed APK not found at $SIGNED_APK"
+            echo "Error: Target APK not found at $ORIGINAL_APK"
             exit 1
           fi
 
