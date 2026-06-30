@@ -217,15 +217,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-//    private fun setupLogs() {
-//        lifecycleScope.launch {
-//            LogRepository.logs.collectLatest { message ->
-//                binding.tvLogs.append("\n$message")
-//                binding.logScrollView.post { binding.logScrollView.fullScroll(android.view.View.FOCUS_DOWN) }
-//            }
-//        }
-//    }
-
     private fun setupLogs() {
         logCollectionJob?.cancel() // safeguard
         binding.tvLogs.text = "Waiting for connection..." // clear old replayed logs from screen
@@ -251,6 +242,7 @@ class MainActivity : AppCompatActivity() {
             dialogBinding.etUsername.setText(targetConfig.username)
             dialogBinding.etLocalPort.setText(targetConfig.localPort.toString())
             dialogBinding.cbSocks5.isChecked = targetConfig.isSocks5
+            dialogBinding.cbPowerSave.isChecked = targetConfig.isPowerSave
         }
 
         val keys = mutableListOf("None")
@@ -284,6 +276,7 @@ class MainActivity : AppCompatActivity() {
                     username = dialogBinding.etUsername.text.toString()
                     localPort = dialogBinding.etLocalPort.text.toString().toIntOrNull() ?: 1080
                     isSocks5 = dialogBinding.cbSocks5.isChecked
+                    isPowerSave = dialogBinding.cbPowerSave.isChecked
                     val selectedKey = dialogBinding.spinnerKeys.selectedItem.toString()
                     keyAlias = if (selectedKey == "None") null else selectedKey
                 }
